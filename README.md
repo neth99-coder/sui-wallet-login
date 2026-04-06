@@ -1,146 +1,353 @@
-# Sui zkLogin Wallet Starter
+# Sui zkLogin Wallet with Enoki
 
-This project is a basic Sui web app that lets a user:
+This project is a small Sui web wallet built to demonstrate how a user can sign in with Google, get a zkLogin-based Sui wallet, and read token balances on Sui testnet without installing a browser wallet extension.
 
-1. Click Log in with Google.
-2. Create or restore a zkLogin wallet on Sui testnet.
-3. View the wallet address and token balances.
-4. Log out from the dApp session.
+It is intentionally narrow in scope. The app does not send transactions. It focuses on the core onboarding path:
 
-The app uses:
+1. Sign in with Google.
+2. Create or restore the user's zkLogin wallet.
+3. Read the wallet address.
+4. Load balances from Sui testnet.
+5. Log out of the dApp session.
 
-- React + Vite
-- `@mysten/dapp-kit-react` for wallet integration
-- `@mysten/enoki` for Google OAuth-backed zkLogin wallet registration
-- `@mysten/sui` for balance reads on Sui testnet
+## What this project is trying to teach
 
-## Prerequisites
+This repository is useful if you want to understand these pieces together:
+
+- what a Sui zkLogin wallet is
+- what Enoki does in the zkLogin flow
+- how Google OAuth is connected to wallet creation
+- how a React app can integrate the login flow
+- how to read balances from Sui once the account is connected
+
+## Core technologies
+
+### Sui
+
+Sui is the blockchain this app connects to. In this project, the app is configured for `testnet`, not mainnet.
+
+The app uses a Sui client to:
+
+- resolve the connected account
+- request balances owned by that account
+- fetch coin metadata for better balance display
+
+### zkLogin
+
+zkLogin is a Sui feature that lets a user authenticate with a Web2 identity provider such as Google and derive a Sui address from that login, instead of managing a traditional wallet seed phrase in the UI.
+
+Conceptually, zkLogin combines:
+
+- an OpenID Connect provider such as Google
+- a JWT returned by that provider
+- Sui-specific cryptographic proofs
+- a user salt and ephemeral signing material
+
+The result is a blockchain address that is tied to the user's identity for this app configuration.
+
+### Enoki
+
+Enoki is Mysten's developer platform that simplifies zkLogin integration. Instead of manually implementing the entire nonce, salt, proof, and session workflow yourself, Enoki handles the hard parts needed for a production-style zkLogin onboarding flow.
+
+In this project, Enoki is responsible for:
+
+- creating the zkLogin nonce
+- managing the Google login integration for the wallet flow
+- resolving the user's zkLogin wallet address from the Google JWT
+- wiring the wallet into the Sui wallet standard / dApp Kit flow
+
+Without Enoki, you would need to implement and operate more of the zkLogin backend-sensitive flow yourself.
+
+### Google OAuth
+
+Google is the identity provider used in this app. The user signs in through Google, Google returns an authentication result, and that result is used in the zkLogin flow.
+
+This project uses a Google OAuth Web Client ID. The client secret is not needed in the frontend and should never be exposed in a Vite app.
+
+### React + Vite
+
+The UI is built with React and bundled with Vite. Vite is used for local development, environment variables, and production builds.
+
+### `@mysten/dapp-kit-react`
+
+This package provides wallet integration primitives for Sui apps. In this project it is used to:
+
+- create the dApp Kit provider
+- access the current account and wallet
+- access the current Sui client and network
+- connect and disconnect the Enoki wallet
+
+### `@tanstack/react-query`
+
+React Query is used for loading balances from Sui and managing loading / error state around those requests.
+
+## How the implementation works
+
+### High-level architecture
+
+The app has three main runtime responsibilities:
+
+1. Configure the Sui testnet client and dApp Kit.
+2. Register a Google-based Enoki wallet provider.
+3. Render UI that connects the wallet and reads balances.
+
+The relevant files are:
+
+- `src/dapp-kit.ts`
+- `src/RegisterEnokiWallets.tsx`
+- `src/App.tsx`
+
+### 1. Sui client and dApp Kit setup
+
+In `src/dapp-kit.ts`, the app creates a dApp Kit instance for `testnet`.
+
+Key points:
+
+- the default network is `testnet`
+- the app creates a `SuiGrpcClient` for that network
+- `autoConnect: true` lets the app restore the wallet session when possible
+
+This file is the central network configuration for the app.
+
+### 2. Registering the Enoki wallet
+
+In `src/RegisterEnokiWallets.tsx`, the app registers a Google wallet backed by Enoki.
+
+That component does four important things:
+
+1. Reads the current Sui client and network from dApp Kit.
+2. Reads `VITE_ENOKI_API_KEY` and `VITE_GOOGLE_CLIENT_ID` from the frontend environment.
+3. Builds the redirect URL from the current browser location.
+4. Calls `registerEnokiWallets()` to create a Google wallet provider for the app.
+
+This is the bridge between the wallet framework and Enoki.
+
+### 3. Wallet UI and balance loading
+
+In `src/App.tsx`, the app:
+
+- finds the registered Google Enoki wallet
+- triggers wallet connection when the user clicks the button
+- reads the connected account from dApp Kit
+- loads balances for the connected Sui address
+- formats and displays coin balances
+- disconnects the wallet on logout
+
+The balance loading path looks like this:
+
+1. Get the current account address.
+2. Call `client.listBalances({ owner: account.address })`.
+3. For each coin type, call `client.getCoinMetadata()`.
+4. Display symbol, name, and formatted amount.
+
+## End-to-end login flow
+
+This is the actual user flow in this project:
+
+1. The page loads and mounts the dApp Kit provider.
+2. The app registers the Enoki Google wallet using the API key and Google client ID.
+3. The user clicks `Log in with Google`.
+4. dApp Kit asks the selected Enoki wallet to connect.
+5. Enoki opens the Google OAuth popup.
+6. Google authenticates the user and returns control to the redirect URL.
+7. Enoki uses the login result to resolve the user's zkLogin wallet.
+8. dApp Kit exposes the connected Sui account to the React app.
+9. The app loads token balances for that address.
+
+## What logout means in this app
+
+Logout in this app means disconnecting the current Enoki wallet session from the dApp.
+
+It does not necessarily mean:
+
+- the user is globally signed out of Google
+- all browser-level authentication state is cleared
+
+It means the dApp is no longer treating the wallet as the active connected account.
+
+## Setup guide
+
+## 1. Prerequisites
+
+You need:
 
 - Node.js 20+
 - npm 10+
-- A Google Cloud project with an OAuth 2.0 Web Client
-- An Enoki app and public API key
+- a Google Cloud project
+- a Google OAuth 2.0 Web Client ID
+- an Enoki app
+- an Enoki public API key
 
-## Required setup
-
-### 1. Create a Google OAuth client
+## 2. Google Cloud configuration
 
 In Google Cloud Console:
 
-1. Create or select a project.
+1. Create or choose a project.
 2. Configure the OAuth consent screen.
-3. Create an OAuth 2.0 Client ID of type Web application.
-4. Add your local and production URLs to Authorized JavaScript origins.
-5. Add matching redirect URLs to Authorized redirect URIs.
+3. Create an OAuth 2.0 Client ID of type `Web application`.
+4. Add the frontend origin to `Authorized JavaScript origins`.
+5. Add the exact redirect URL to `Authorized redirect URIs`.
 
-For local development with Vite, use at least:
+For local development with Vite, use:
 
 - Authorized JavaScript origin: `http://localhost:5173`
 - Authorized redirect URI: `http://localhost:5173/`
 
-The redirect URI must match exactly. For this app, the local redirect URI includes the trailing slash.
+The trailing slash matters because the app uses the exact browser URL as the redirect target.
 
-If you host the app elsewhere, add:
+If you run Vite on another port, replace `5173` with the actual port.
 
-- the site origin to Authorized JavaScript origins, for example `https://your-app.example`
-- the exact app URL to Authorized redirect URIs, for example `https://your-app.example/`
-
-If you deploy under a subpath, the redirect URI must include that full path, for example `https://your-app.example/sui-wallet-login/`.
-
-### 2. Create an Enoki app
+## 3. Enoki configuration
 
 In the Enoki portal:
 
 1. Create an app.
-2. Add your local and production origins to the allow list.
-3. Open Auth providers.
-4. Enable Google.
+2. Add `http://localhost:5173` to the allowed origins list.
+3. Open `Auth providers`.
+4. Enable `Google`.
 5. Paste the same Google OAuth Client ID you created in Google Cloud.
-6. Copy the public API key.
+6. Ensure the app supports `testnet`, since this project uses testnet.
+7. Copy the public API key for that app.
 
-The Google Client ID configured in Enoki must match `VITE_GOOGLE_CLIENT_ID` in your local `.env` file.
+The key point is that the Google client ID must match in all three places:
 
-This starter uses Enoki for the zkLogin nonce and salt flow, which keeps the app simple and avoids building your own salt service for the basic onboarding case.
+- Google Cloud
+- Enoki Auth provider configuration
+- `.env` as `VITE_GOOGLE_CLIENT_ID`
 
-## Environment variables
+## 4. Local environment variables
 
-Copy `.env.example` to `.env` and fill in the values:
+Copy the example file:
 
 ```bash
 cp .env.example .env
 ```
 
-Variables:
+Then set:
 
-- `VITE_ENOKI_API_KEY`: Your Enoki public API key
-- `VITE_GOOGLE_CLIENT_ID`: Your Google OAuth web client ID
+```dotenv
+VITE_ENOKI_API_KEY=your_enoki_public_api_key
+VITE_GOOGLE_CLIENT_ID=your_google_oauth_web_client_id
+```
 
-## Install
+Do not put a Google client secret into the frontend `.env`. Vite exposes `VITE_*` variables to the browser.
+
+## 5. Install and run
+
+Install dependencies:
 
 ```bash
 npm install
 ```
 
-## Run locally
+Run the development server:
 
 ```bash
 npm run dev
 ```
 
-Open the local URL Vite prints, usually `http://localhost:5173`.
+Build the project:
 
-## How the login flow works
+```bash
+npm run build
+```
 
-1. The app registers an Enoki Google wallet provider against Sui testnet.
-2. The app sends Google back to the exact current app URL as the OAuth redirect URI.
-3. The user clicks Log in with Google.
-4. Enoki starts the zkLogin-compatible Google OAuth flow.
-5. After success, the app receives a zkLogin wallet account derived from the Google identity and Enoki-managed salt.
-6. The app loads balances for that Sui address from testnet.
+Preview the production build:
 
-## How logout works
+```bash
+npm run preview
+```
 
-The Log out button disconnects the Enoki wallet from the dApp and clears the local wallet session state.
+## Repository walkthrough
 
-This does not guarantee a global Google sign-out. It is a dApp session logout.
+### `src/main.tsx`
 
-## Troubleshooting sign-in
+Bootstraps the React app and wraps it with:
 
-If Google sign-in completes but the app still stays on Waiting, check these first:
+- `QueryClientProvider` for React Query
+- `DAppKitProvider` for Sui wallet state
+- `RegisterEnokiWallets` so the Google wallet is available before the app renders
 
-1. Google OAuth settings must exactly match local dev:
-   - Authorized JavaScript origin: `http://localhost:5173`
-   - Authorized redirect URI: `http://localhost:5173/`
-2. Your Enoki app must allow the local origin `http://localhost:5173`.
-3. The `VITE_GOOGLE_CLIENT_ID` in your `.env` must be the same OAuth client you configured in Google Cloud.
-4. Restart `npm run dev` after changing `.env` values.
-5. Open the browser console if the app shows a login error after the popup closes.
+### `src/dapp-kit.ts`
 
-If Vite runs on a different port, replace `5173` with the exact port shown in your terminal in both Google Cloud and the Enoki allow list.
+Creates the dApp Kit instance and pins the app to Sui testnet.
+
+### `src/RegisterEnokiWallets.tsx`
+
+Registers the Google Enoki wallet and supplies:
+
+- the Enoki public API key
+- the Google client ID
+- the redirect URL
+- the active Sui client and network
+
+### `src/App.tsx`
+
+Contains the app's main business logic:
+
+- login button
+- logout button
+- account display
+- error display for auth failures
+- balance fetching and formatting
+
+### `src/index.css` and `src/App.css`
+
+Contain the global and page-level styling for the app.
+
+## Why this project uses Enoki instead of raw zkLogin
+
+You can build zkLogin flows directly with lower-level Sui tooling, but then you need to manage more of the integration yourself. For a learning project and a lightweight app, Enoki is the practical choice because it reduces the amount of custom infrastructure you need to write.
+
+That is why this project can stay frontend-focused while still demonstrating a real zkLogin wallet flow.
+
+## Current limitations
+
+This app is intentionally limited.
+
+It currently does not include:
+
+- transaction signing UI
+- token transfers
+- sponsored transactions
+- mainnet support
+- multi-provider login
+- profile storage or app-specific backend logic
+
+## Common issues
+
+### `redirect_uri_mismatch`
+
+Your Google Cloud redirect URI does not exactly match the redirect URI used by the app.
+
+For local dev, verify:
+
+- `http://localhost:5173` in Authorized JavaScript origins
+- `http://localhost:5173/` in Authorized redirect URIs
+
+### `Request to Enoki API failed (status: 400)`
+
+This usually means one of these is wrong:
+
+- the Enoki app does not allow your local origin
+- the Enoki API key belongs to a different app than the one you configured
+- the Google client ID does not match between Google, Enoki, and `.env`
+- the app is running on a different port than the one you allowed
+- the Enoki app is not configured for the network this project uses
+
+### Wallet stays in `Waiting`
+
+This usually means the popup flow completed, but the wallet session was not fully established. Check the auth error shown in the UI and verify the configuration items above.
 
 ## Funding the wallet on testnet
 
-The first login creates the wallet address, but it will usually have zero balance.
+The first login usually creates an address with no funds.
 
 To test balances:
 
-1. Copy the wallet address shown in the app.
-2. Send testnet tokens to it from another wallet or a faucet workflow you already use.
-3. Click Refresh balances.
-
-## Project structure
-
-- `src/dapp-kit.ts`: Sui testnet dApp Kit client setup
-- `src/RegisterEnokiWallets.tsx`: Google Enoki wallet registration hook-up
-- `src/App.tsx`: Login, logout, address display, balance loading UI
-- `src/index.css`: Global theme and layout foundation
-- `src/App.css`: Page-specific styling
-
-## Notes for developers
-
-- The app is intentionally read-only for now. It creates/restores a zkLogin wallet and displays balances, but does not submit transactions.
-- If you later want to add sends or sponsored transactions, keep using Enoki so the proof flow stays aligned with the wallet session.
-- The default network is Sui testnet.
+1. Copy the address shown in the app.
+2. Send testnet assets to that address.
+3. Click `Refresh balances`.
 
 ## Scripts
 
@@ -150,3 +357,7 @@ npm run build
 npm run preview
 npm run lint
 ```
+
+## Summary
+
+This project is a simple reference implementation of a Sui zkLogin wallet using Google authentication and Enoki. The main educational value is seeing how identity, wallet creation, and balance reads fit together in a React app without requiring a traditional browser wallet extension.
