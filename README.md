@@ -120,6 +120,39 @@ The Walrus SDK is used here for Walrus-specific client helpers, especially:
 - reading parsed Walrus blob objects from Sui by object ID
 - reading Walrus blob attributes when present
 
+### `@mysten/seal`
+
+The Seal SDK is now included for encryption and decryption helpers.
+
+This repo does not yet ship a published Seal access-policy Move package, so the
+frontend cannot offer a generic one-click decrypt button by itself. Seal
+decryption always depends on two app-specific pieces:
+
+- a deployed Move package that defines one or more `seal_approve*` functions
+- transaction-kind bytes that call the correct `seal_approve*` function for that
+  package
+
+The helper module lives in `src/seal.ts` and gives you the browser-side pieces
+that are reusable across policies:
+
+- create a `SealClient` with testnet key server defaults
+- encrypt bytes with `encryptWithSeal()`
+- create a wallet-backed `SessionKey` using `dAppKit.signPersonalMessage()`
+- build transaction-kind bytes for a `seal_approve` call
+- decrypt bytes with `decryptWithSeal()` once you have the correct approval PTB
+
+The default server config in `src/seal.ts` uses the public Mysten testnet
+committee aggregator:
+
+- committee object ID:
+  `0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98`
+- aggregator URL:
+  `https://seal-aggregator-testnet.mystenlabs.com`
+
+That is enough to start encrypting on testnet, but you still need your own
+policy package ID and approval call shape before decryption can be wired into an
+app workflow such as Walrus download.
+
 ## How the implementation works
 
 ### High-level architecture
@@ -222,6 +255,55 @@ When a user uploads a file, the app performs these steps:
 7. Poll the owned-object query until the object appears in the list.
 
 The upload code lives primarily in `handleWalrusUpload()` in `src/App.tsx`.
+
+## Seal helper example
+
+The frontend now includes a reusable Seal helper module in `src/seal.ts`. A
+minimal usage pattern looks like this:
+
+```ts
+import {
+  buildTransactionKindBytes,
+  createSealApprovalTransaction,
+  createWalletBackedSessionKey,
+  decryptWithSeal,
+  encryptWithSeal,
+  hexStringToBytes,
+} from "./src/seal";
+
+const { encryptedObject } = await encryptWithSeal({
+  suiClient: client,
+  packageId: "0x...policy-package",
+  id: "0x...policy-id",
+  data: fileBytes,
+});
+
+const tx = createSealApprovalTransaction({
+  packageId: "0x...policy-package",
+  moduleName: "private_data",
+  idBytes: hexStringToBytes("0x...policy-id"),
+});
+
+const txBytes = await buildTransactionKindBytes(client, tx);
+
+const sessionKey = await createWalletBackedSessionKey({
+  address: account.address,
+  dAppKit,
+  packageId: "0x...policy-package",
+  suiClient: client,
+});
+
+const decryptedBytes = await decryptWithSeal({
+  suiClient: client,
+  encryptedBytes: encryptedObject,
+  sessionKey,
+  txBytes,
+});
+```
+
+Replace the package ID, module name, policy ID, and any extra PTB arguments with
+the ones required by your Move package. That policy-specific part is what decides
+who is allowed to decrypt.
 
 ### What metadata is stored on Sui
 
