@@ -380,6 +380,11 @@ function App() {
     await new Promise((resolve) => window.setTimeout(resolve, milliseconds));
   }
 
+  async function reloadPageAfterUploadSuccess() {
+    await delay(900);
+    window.location.reload();
+  }
+
   async function refreshWalrusFilesUntilVisible(objectId: string) {
     console.log(
       "[walrus] refreshWalrusFilesUntilVisible: waiting for objectId",
@@ -569,6 +574,7 @@ function App() {
 
       setUploadFile(null);
       setUploadEpochs("1");
+      await reloadPageAfterUploadSuccess();
     } catch (error) {
       console.error("Upload error:", error);
       setUploadError(error instanceof Error ? error.message : "Upload failed");
