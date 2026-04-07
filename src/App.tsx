@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
 import { Transaction } from "@mysten/sui/transactions";
 import {
   useCurrentAccount,
@@ -24,6 +25,7 @@ import {
   getWalrusDownloadUrl,
   getWalrusFileName,
   getWalrusPublisherUrl,
+  getWalrusUploadedAt,
   normalizeBlobId,
   type WalrusBlobRecord,
 } from "./walrus";
@@ -70,6 +72,45 @@ type UploadResponse = {
   };
 };
 
+type DeletedBlobRecord = {
+  blobId: string | null;
+  contentType: string | null;
+  deletable: boolean | null;
+  digest: string | null;
+  fileName: string | null;
+  objectId: string;
+  size: string | null;
+  storedUntilEpoch: number | null;
+  timestampMs: string | null;
+  uploadedAt: string | null;
+};
+
+type DeletedHistoryArgument =
+  | "GasCoin"
+  | { Input: number }
+  | { Result: number }
+  | { NestedResult: [number, number] };
+
+type DeletedHistoryTransaction = {
+  digest: string;
+  timestampMs?: string | null;
+  transaction?: {
+    data?: {
+      transaction?: {
+        kind?: string;
+        inputs?: Array<{ objectId?: string; type?: string }>;
+        transactions?: Array<{
+          MoveCall?: {
+            arguments?: DeletedHistoryArgument[];
+            function: string;
+            module: string;
+          };
+        }>;
+      };
+    };
+  };
+};
+
 const isConfigured = Boolean(
   import.meta.env.VITE_ENOKI_API_KEY && import.meta.env.VITE_GOOGLE_CLIENT_ID,
 );
@@ -77,6 +118,9 @@ const isConfigured = Boolean(
 const walrusPublisherUrl = getWalrusPublisherUrl();
 const walrusAggregatorUrl = getWalrusAggregatorUrl();
 const maxUploadBytes = getMaxPublicUploadBytes();
+const JSON_RPC_URLS = {
+  testnet: "https://fullnode.testnet.sui.io:443",
+} as const;
 
 function App() {
   const account = useCurrentAccount();
@@ -94,10 +138,31 @@ function App() {
   const [uploadFeedback, setUploadFeedback] = useState<UploadFeedback | null>(
     null,
   );
+  const [fileActionError, setFileActionError] = useState<string | null>(null);
+  const [deletingObjectId, setDeletingObjectId] = useState<string | null>(null);
+  const [filesTab, setFilesTab] = useState<"active" | "expired" | "deleted">(
+    "active",
+  );
+  const [hiddenDeletedObjectIds, setHiddenDeletedObjectIds] = useState<
+    string[]
+  >([]);
+  const [deletedSnapshots, setDeletedSnapshots] = useState<
+    Record<string, DeletedBlobRecord>
+  >({});
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const copyResetTimeoutRef = useRef<number | null>(null);
 
   const walrusClient = useMemo(() => getWalrusClient(client), [client]);
+  const historyClient = useMemo(() => {
+    const network = currentNetwork as keyof typeof JSON_RPC_URLS;
+    const url = JSON_RPC_URLS[network];
+
+    if (!url) {
+      return null;
+    }
+
+    return new SuiJsonRpcClient({ network, url });
+  }, [currentNetwork]);
 
   const googleWallet = useMemo(
     () => wallets.filter(isEnokiWallet).find(isGoogleWallet) ?? null,
@@ -248,6 +313,7 @@ function App() {
               getWalrusFileName(attributes) ??
               formatBlobLabel(normalizedBlobId);
             const contentType = getWalrusContentType(attributes);
+            const uploadedAt = getWalrusUploadedAt(attributes);
 
             return {
               blobId: normalizedBlobId,
@@ -260,6 +326,7 @@ function App() {
               registeredEpoch: blobObject.registered_epoch,
               size: blobObject.size,
               storedUntilEpoch: blobObject.storage.end_epoch,
+              uploadedAt,
             } satisfies WalrusBlobRecord;
           } catch (error) {
             // Any unexpected error for a single object should not kill the whole list
@@ -340,6 +407,35 @@ function App() {
       "[walrus] objectId never appeared after 4 attempts:",
       objectId,
     );
+  }
+
+  async function refreshWalrusFilesUntilDeleted(objectId: string) {
+    console.log(
+      "[walrus] refreshWalrusFilesUntilDeleted: waiting for objectId removal",
+      objectId,
+    );
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const result = await walrusFilesQuery.refetch();
+      const stillExists =
+        result.data?.some((file) => file.objectId === objectId) ?? false;
+
+      console.log(
+        `[walrus] delete attempt ${attempt + 1}: object still present =`,
+        stillExists,
+      );
+
+      if (!stillExists) {
+        setHiddenDeletedObjectIds((current) =>
+          current.filter((id) => id !== objectId),
+        );
+        return;
+      }
+
+      if (attempt < 3) {
+        await delay(1200);
+      }
+    }
   }
 
   async function persistWalrusMetadataOnSui(
@@ -541,6 +637,72 @@ function App() {
     URL.revokeObjectURL(objectUrl);
   }
 
+  async function handleDelete(file: WalrusBlobRecord) {
+    if (!account || !file.deletable || deletingObjectId) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete ${getDisplayFileName(file)}? This removes the Walrus blob object from your wallet.`,
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setFileActionError(null);
+    setDeletingObjectId(file.objectId);
+
+    try {
+      const transaction = walrusClient.walrus.deleteBlobTransaction({
+        blobObjectId: file.objectId,
+        owner: account.address,
+      });
+
+      await dAppKit.signAndExecuteTransaction({ transaction });
+
+      setDeletedSnapshots((current) => ({
+        ...current,
+        [file.objectId]: {
+          blobId: file.blobId,
+          contentType: file.contentType,
+          deletable: file.deletable,
+          digest: null,
+          fileName: file.fileName,
+          objectId: file.objectId,
+          size: file.size,
+          storedUntilEpoch: file.storedUntilEpoch,
+          timestampMs: String(Date.now()),
+          uploadedAt: file.uploadedAt,
+        },
+      }));
+
+      setHiddenDeletedObjectIds((current) =>
+        current.includes(file.objectId) ? current : [...current, file.objectId],
+      );
+
+      if (
+        uploadFeedback?.kind === "newly-created" &&
+        uploadFeedback.objectId === file.objectId
+      ) {
+        setUploadFeedback(null);
+      }
+
+      await refreshWalrusFilesUntilDeleted(file.objectId);
+      await deletedFilesQuery.refetch();
+    } catch (error) {
+      console.error("Delete error:", error);
+      setHiddenDeletedObjectIds((current) =>
+        current.filter((id) => id !== file.objectId),
+      );
+      setFileActionError(
+        error instanceof Error ? error.message : "Failed to delete file",
+      );
+    } finally {
+      setDeletingObjectId(null);
+    }
+  }
+
   const walrusEpochQuery = useQuery({
     queryKey: ["walrus-epoch", currentNetwork],
     enabled: Boolean(account),
@@ -550,8 +712,54 @@ function App() {
     },
   });
 
+  const deletedFilesQuery = useQuery({
+    queryKey: ["deleted-files", currentNetwork, account?.address],
+    enabled: Boolean(account && historyClient),
+    queryFn: async (): Promise<DeletedBlobRecord[]> => {
+      if (!account || !historyClient) {
+        return [];
+      }
+
+      const response = await historyClient.queryTransactionBlocks({
+        filter: { FromAddress: account.address },
+        limit: 100,
+        options: { showInput: true },
+        order: "descending",
+      });
+
+      const records = new Map<string, DeletedBlobRecord>();
+
+      for (const tx of response.data as DeletedHistoryTransaction[]) {
+        for (const objectId of extractDeletedBlobObjectIds(tx)) {
+          if (!records.has(objectId)) {
+            records.set(objectId, {
+              blobId: null,
+              contentType: null,
+              deletable: true,
+              digest: tx.digest,
+              fileName: null,
+              objectId,
+              size: null,
+              storedUntilEpoch: null,
+              timestampMs: tx.timestampMs ?? null,
+              uploadedAt: null,
+            });
+          }
+        }
+      }
+
+      return Array.from(records.values());
+    },
+  });
+
   const currentEpoch = walrusEpochQuery.data ?? null;
-  const allFiles = walrusFilesQuery.data ?? [];
+  const allFiles = (walrusFilesQuery.data ?? []).filter(
+    (file) => !hiddenDeletedObjectIds.includes(file.objectId),
+  );
+  const deletedFiles = mergeDeletedBlobRecords(
+    deletedFilesQuery.data ?? [],
+    Object.values(deletedSnapshots),
+  );
   const activeFiles =
     currentEpoch !== null
       ? allFiles.filter((f) => f.storedUntilEpoch >= currentEpoch)
@@ -562,6 +770,9 @@ function App() {
       : [];
   const totalFiles = allFiles.length;
   const totalAssets = balancesQuery.data?.length ?? 0;
+  const activeCount = activeFiles.length;
+  const expiredCount = expiredFiles.length;
+  const deletedCount = deletedFiles.length;
 
   async function copyTextToClipboard(text: string) {
     if (navigator.clipboard?.writeText) {
@@ -902,31 +1113,84 @@ function App() {
             <section className="card files-panel">
               <div className="card-header">
                 <h2>
-                  Files
-                  {totalFiles > 0 ? (
-                    <span className="count-badge">{totalFiles}</span>
-                  ) : null}
+                  {filesTab === "active"
+                    ? "Active"
+                    : filesTab === "expired"
+                      ? "Expired"
+                      : "Deleted"}
+                  <span className="count-badge">
+                    {filesTab === "active"
+                      ? activeCount
+                      : filesTab === "expired"
+                        ? expiredCount
+                        : deletedCount}
+                  </span>
                 </h2>
                 <button
                   className="btn btn-ghost btn-sm"
-                  onClick={() => void walrusFilesQuery.refetch()}
+                  onClick={() => {
+                    void walrusFilesQuery.refetch();
+                    void deletedFilesQuery.refetch();
+                  }}
                 >
                   ↻ Refresh
                 </button>
               </div>
 
-              {walrusFilesQuery.isPending ? (
+              <div className="panel-tabs">
+                <button
+                  className={`panel-tab ${filesTab === "active" ? "panel-tab-active" : ""}`}
+                  onClick={() => setFilesTab("active")}
+                  type="button"
+                >
+                  Active
+                </button>
+                <button
+                  className={`panel-tab ${filesTab === "expired" ? "panel-tab-active" : ""}`}
+                  onClick={() => setFilesTab("expired")}
+                  type="button"
+                >
+                  Expired
+                </button>
+                <button
+                  className={`panel-tab ${filesTab === "deleted" ? "panel-tab-active" : ""}`}
+                  onClick={() => setFilesTab("deleted")}
+                  type="button"
+                >
+                  Deleted
+                </button>
+              </div>
+
+              {(filesTab === "active" || filesTab === "expired") &&
+              walrusFilesQuery.isPending ? (
                 <p className="state-text">Loading files\u2026</p>
               ) : null}
 
-              {walrusFilesQuery.isError ? (
+              {(filesTab === "active" || filesTab === "expired") &&
+              walrusFilesQuery.isError ? (
                 <p className="state-text state-error">
                   {(walrusFilesQuery.error as Error).message}
                 </p>
               ) : null}
 
-              {!walrusFilesQuery.isPending && !walrusFilesQuery.isError ? (
-                allFiles.length > 0 ? (
+              {filesTab === "deleted" && deletedFilesQuery.isPending ? (
+                <p className="state-text">Loading deleted history\u2026</p>
+              ) : null}
+
+              {filesTab === "deleted" && deletedFilesQuery.isError ? (
+                <p className="state-text state-error">
+                  {(deletedFilesQuery.error as Error).message}
+                </p>
+              ) : null}
+
+              {fileActionError ? (
+                <p className="state-text state-error">{fileActionError}</p>
+              ) : null}
+
+              {filesTab === "active" &&
+              !walrusFilesQuery.isPending &&
+              !walrusFilesQuery.isError ? (
+                activeFiles.length > 0 ? (
                   <div className="file-list">
                     {activeFiles.map((file) => (
                       <article className="file-row" key={file.objectId}>
@@ -997,114 +1261,253 @@ function App() {
                             >
                               {file.deletable ? "deletable" : "permanent"}
                             </span>
+                            {file.uploadedAt ? (
+                              <span className="meta-chip meta-chip-uploaded">
+                                uploaded {formatUploadedAt(file.uploadedAt)}
+                              </span>
+                            ) : null}
                           </div>
                         </div>
-                        <button
-                          className="btn btn-outline btn-sm"
-                          onClick={() =>
-                            void handleDownload(
-                              file.downloadUrl,
-                              file.fileName !==
-                                `blob-${file.blobId.slice(0, 10)}`
-                                ? file.fileName
-                                : file.objectId,
-                              file.contentType,
-                            )
-                          }
-                        >
-                          ↓
-                        </button>
+                        <div className="file-row-actions">
+                          {file.deletable ? (
+                            <button
+                              className="btn btn-danger btn-sm"
+                              disabled={deletingObjectId === file.objectId}
+                              onClick={() => void handleDelete(file)}
+                              title="Delete blob"
+                              type="button"
+                            >
+                              {deletingObjectId === file.objectId
+                                ? "…"
+                                : "Delete"}
+                            </button>
+                          ) : null}
+                          <button
+                            className="btn btn-outline btn-sm"
+                            onClick={() =>
+                              void handleDownload(
+                                file.downloadUrl,
+                                file.fileName !==
+                                  `blob-${file.blobId.slice(0, 10)}`
+                                  ? file.fileName
+                                  : file.objectId,
+                                file.contentType,
+                              )
+                            }
+                            type="button"
+                          >
+                            ↓
+                          </button>
+                        </div>
                       </article>
                     ))}
-                    {expiredFiles.length > 0 ? (
-                      <>
-                        <div className="file-section-divider">
-                          <span>Expired</span>
-                        </div>
-                        {expiredFiles.map((file) => (
-                          <article
-                            className="file-row file-row-expired"
-                            key={file.objectId}
-                          >
-                            <div className="file-row-info">
-                              <span className="file-name">
-                                {getDisplayFileName(file)}
-                              </span>
-                              <div className="file-id-row mono">
-                                <button
-                                  className="file-id copy-id-btn"
-                                  onClick={() =>
-                                    void handleCopy(
-                                      `object-${file.objectId}`,
-                                      file.objectId,
-                                    )
-                                  }
-                                  title="Copy object ID"
-                                  type="button"
-                                >
-                                  Object {shortenObjectId(file.objectId)}
-                                  <span className="copy-status">
-                                    {copiedKey === `object-${file.objectId}`
-                                      ? "Copied"
-                                      : "Copy"}
-                                  </span>
-                                </button>
-                                <button
-                                  className="file-id copy-id-btn"
-                                  onClick={() =>
-                                    void handleCopy(
-                                      `blob-${file.objectId}`,
-                                      file.blobId,
-                                    )
-                                  }
-                                  title="Copy blob ID"
-                                  type="button"
-                                >
-                                  Blob {shortenBlobId(file.blobId)}
-                                  <span className="copy-status">
-                                    {copiedKey === `blob-${file.objectId}`
-                                      ? "Copied"
-                                      : "Copy"}
-                                  </span>
-                                </button>
-                              </div>
-                              <div className="file-row-meta">
-                                {file.contentType ? (
-                                  <span className="badge-type">
-                                    {file.contentType}
-                                  </span>
-                                ) : null}
-                                <span className="file-size meta-chip">
-                                  {formatBytes(file.size)}
-                                </span>
-                                <span className="file-epoch file-epoch-expired meta-chip">
-                                  ep.{file.storedUntilEpoch}
-                                  <span
-                                    className="info-tip"
-                                    aria-label={`Storage ended at epoch ${file.storedUntilEpoch}. Current epoch: ${currentEpoch ?? "unknown"}. The blob object still exists on Sui but the data may no longer be retrievable.`}
-                                  >
-                                    ⓘ
-                                  </span>
-                                </span>
-                                <span className="badge-mode badge-expired">
-                                  expired
-                                </span>
-                              </div>
-                            </div>
-                            <button
-                              className="btn btn-outline btn-sm"
-                              disabled
-                              title="Storage epoch has ended"
-                            >
-                              ↓
-                            </button>
-                          </article>
-                        ))}
-                      </>
-                    ) : null}
                   </div>
                 ) : (
-                  <p className="state-text">No files found for this address.</p>
+                  <p className="state-text">
+                    No active files found for this address.
+                  </p>
+                )
+              ) : null}
+
+              {filesTab === "expired" &&
+              !walrusFilesQuery.isPending &&
+              !walrusFilesQuery.isError ? (
+                expiredFiles.length > 0 ? (
+                  <div className="file-list">
+                    {expiredFiles.map((file) => (
+                      <article
+                        className="file-row file-row-expired"
+                        key={file.objectId}
+                      >
+                        <div className="file-row-info">
+                          <span className="file-name">
+                            {getDisplayFileName(file)}
+                          </span>
+                          <div className="file-id-row mono">
+                            <button
+                              className="file-id copy-id-btn"
+                              onClick={() =>
+                                void handleCopy(
+                                  `object-${file.objectId}`,
+                                  file.objectId,
+                                )
+                              }
+                              title="Copy object ID"
+                              type="button"
+                            >
+                              Object {shortenObjectId(file.objectId)}
+                              <span className="copy-status">
+                                {copiedKey === `object-${file.objectId}`
+                                  ? "Copied"
+                                  : "Copy"}
+                              </span>
+                            </button>
+                            <button
+                              className="file-id copy-id-btn"
+                              onClick={() =>
+                                void handleCopy(
+                                  `blob-${file.objectId}`,
+                                  file.blobId,
+                                )
+                              }
+                              title="Copy blob ID"
+                              type="button"
+                            >
+                              Blob {shortenBlobId(file.blobId)}
+                              <span className="copy-status">
+                                {copiedKey === `blob-${file.objectId}`
+                                  ? "Copied"
+                                  : "Copy"}
+                              </span>
+                            </button>
+                          </div>
+                          <div className="file-row-meta">
+                            {file.contentType ? (
+                              <span className="badge-type">
+                                {file.contentType}
+                              </span>
+                            ) : null}
+                            <span className="file-size meta-chip">
+                              {formatBytes(file.size)}
+                            </span>
+                            <span className="file-epoch file-epoch-expired meta-chip">
+                              ep.{file.storedUntilEpoch}
+                              <span
+                                className="info-tip"
+                                aria-label={`Storage ended at epoch ${file.storedUntilEpoch}. Current epoch: ${currentEpoch ?? "unknown"}. The blob object still exists on Sui but the data may no longer be retrievable.`}
+                              >
+                                ⓘ
+                              </span>
+                            </span>
+                            <span className="badge-mode badge-expired">
+                              expired
+                            </span>
+                            {file.uploadedAt ? (
+                              <span className="meta-chip meta-chip-uploaded">
+                                uploaded {formatUploadedAt(file.uploadedAt)}
+                              </span>
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="file-row-actions">
+                          {file.deletable ? (
+                            <button
+                              className="btn btn-danger btn-sm"
+                              disabled
+                              title="Expired blobs cannot be deleted"
+                              type="button"
+                            >
+                              Delete
+                            </button>
+                          ) : null}
+                          <button
+                            className="btn btn-outline btn-sm"
+                            disabled
+                            title="Storage epoch has ended"
+                            type="button"
+                          >
+                            ↓
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="state-text">
+                    No expired files for this address.
+                  </p>
+                )
+              ) : null}
+
+              {filesTab === "deleted" &&
+              !deletedFilesQuery.isPending &&
+              !deletedFilesQuery.isError ? (
+                deletedFiles.length > 0 ? (
+                  <div className="file-list">
+                    {deletedFiles.map((file) => (
+                      <article
+                        className="file-row file-row-expired"
+                        key={file.objectId}
+                      >
+                        <div className="file-row-info">
+                          <span className="file-name">
+                            {getDeletedDisplayName(file)}
+                          </span>
+                          <div className="file-id-row mono">
+                            <button
+                              className="file-id copy-id-btn"
+                              onClick={() =>
+                                void handleCopy(
+                                  `deleted-object-${file.objectId}`,
+                                  file.objectId,
+                                )
+                              }
+                              title="Copy object ID"
+                              type="button"
+                            >
+                              Object {shortenObjectId(file.objectId)}
+                              <span className="copy-status">
+                                {copiedKey === `deleted-object-${file.objectId}`
+                                  ? "Copied"
+                                  : "Copy"}
+                              </span>
+                            </button>
+                            {file.blobId ? (
+                              <button
+                                className="file-id copy-id-btn"
+                                onClick={() =>
+                                  void handleCopy(
+                                    `deleted-blob-${file.objectId}`,
+                                    file.blobId as string,
+                                  )
+                                }
+                                title="Copy blob ID"
+                                type="button"
+                              >
+                                Blob {shortenBlobId(file.blobId)}
+                                <span className="copy-status">
+                                  {copiedKey === `deleted-blob-${file.objectId}`
+                                    ? "Copied"
+                                    : "Copy"}
+                                </span>
+                              </button>
+                            ) : null}
+                          </div>
+                          <div className="file-row-meta">
+                            {file.contentType ? (
+                              <span className="badge-type">
+                                {file.contentType}
+                              </span>
+                            ) : null}
+                            {file.size ? (
+                              <span className="file-size meta-chip">
+                                {formatBytes(file.size)}
+                              </span>
+                            ) : null}
+                            {file.timestampMs ? (
+                              <span className="meta-chip">
+                                deleted{" "}
+                                {formatDeletedTimestamp(file.timestampMs)}
+                              </span>
+                            ) : null}
+                            <span className="badge-mode badge-expired">
+                              deleted
+                            </span>
+                            {file.uploadedAt ? (
+                              <span className="meta-chip meta-chip-uploaded">
+                                uploaded {formatUploadedAt(file.uploadedAt)}
+                              </span>
+                            ) : null}
+                          </div>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="state-text">
+                    No deleted Walrus blobs found in this wallet&apos;s Sui
+                    transaction history.
+                  </p>
                 )
               ) : null}
             </section>
@@ -1161,6 +1564,111 @@ function getDisplayFileName(file: WalrusBlobRecord): string {
   return isGeneratedFileName(file.fileName, file.blobId)
     ? `File ${shortenObjectId(file.objectId)}`
     : file.fileName;
+}
+
+function extractDeletedBlobObjectIds(
+  transaction: DeletedHistoryTransaction,
+): string[] {
+  const programmable = transaction.transaction?.data?.transaction;
+
+  if (
+    !programmable ||
+    programmable.kind !== "ProgrammableTransaction" ||
+    !programmable.transactions ||
+    !programmable.inputs
+  ) {
+    return [];
+  }
+
+  const objectIds = new Set<string>();
+
+  for (const command of programmable.transactions) {
+    const moveCall = command.MoveCall;
+
+    if (!moveCall) {
+      continue;
+    }
+
+    if (moveCall.module !== "system" || moveCall.function !== "delete_blob") {
+      continue;
+    }
+
+    const blobArgument = moveCall.arguments?.[1];
+
+    if (
+      !blobArgument ||
+      typeof blobArgument === "string" ||
+      !("Input" in blobArgument)
+    ) {
+      continue;
+    }
+
+    const input = programmable.inputs[blobArgument.Input];
+
+    if (input?.type === "object" && input.objectId) {
+      objectIds.add(input.objectId);
+    }
+  }
+
+  return Array.from(objectIds);
+}
+
+function mergeDeletedBlobRecords(
+  chainRecords: DeletedBlobRecord[],
+  snapshotRecords: DeletedBlobRecord[],
+): DeletedBlobRecord[] {
+  const merged = new Map<string, DeletedBlobRecord>();
+
+  for (const record of chainRecords) {
+    merged.set(record.objectId, record);
+  }
+
+  for (const snapshot of snapshotRecords) {
+    const existing = merged.get(snapshot.objectId);
+    merged.set(snapshot.objectId, {
+      ...existing,
+      ...snapshot,
+      digest: existing?.digest ?? snapshot.digest,
+      timestampMs: existing?.timestampMs ?? snapshot.timestampMs,
+    });
+  }
+
+  return Array.from(merged.values()).sort(
+    (left, right) =>
+      Number(right.timestampMs ?? 0) - Number(left.timestampMs ?? 0),
+  );
+}
+
+function getDeletedDisplayName(file: DeletedBlobRecord): string {
+  if (
+    file.fileName &&
+    file.blobId &&
+    !isGeneratedFileName(file.fileName, file.blobId)
+  ) {
+    return file.fileName;
+  }
+
+  return `Deleted ${shortenObjectId(file.objectId)}`;
+}
+
+function formatDeletedTimestamp(timestampMs: string): string {
+  const value = Number(timestampMs);
+
+  if (!Number.isFinite(value)) {
+    return "recently";
+  }
+
+  return new Date(value).toLocaleString();
+}
+
+function formatUploadedAt(uploadedAt: string): string {
+  const value = Date.parse(uploadedAt);
+
+  if (!Number.isFinite(value)) {
+    return uploadedAt;
+  }
+
+  return new Date(value).toLocaleString();
 }
 
 const MIME_TO_EXT: Record<string, string> = {

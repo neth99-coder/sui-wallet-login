@@ -16,6 +16,7 @@ export type WalrusBlobRecord = {
   registeredEpoch: number;
   size: string;
   storedUntilEpoch: number;
+  uploadedAt: string | null;
 };
 
 type RawWalrusBlobObject = {
@@ -95,6 +96,10 @@ export function getWalrusContentType(
   attributes: Record<string, string> | null,
 ) {
   return attributes?.contentType ?? attributes?.["content-type"] ?? null;
+}
+
+export function getWalrusUploadedAt(attributes: Record<string, string> | null) {
+  return attributes?.uploadedAt ?? attributes?.["uploaded-at"] ?? null;
 }
 
 export function getRawWalrusBlobObject(
