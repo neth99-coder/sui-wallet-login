@@ -1,14 +1,16 @@
-# Sui zkLogin Wallet with Enoki
+# Sui zkLogin Wallet with Enoki and Walrus
 
-This project is a small Sui web wallet built to demonstrate how a user can sign in with Google, get a zkLogin-based Sui wallet, and read token balances on Sui testnet without installing a browser wallet extension.
+This project is a small Sui web wallet built to demonstrate how a user can sign in with Google, get a zkLogin-based Sui wallet, read token balances on Sui testnet, upload a binary file to Walrus, and list the Walrus Blob objects owned by the connected address without installing a browser wallet extension.
 
-It is intentionally narrow in scope. The app does not send transactions. It focuses on the core onboarding path:
+It is intentionally narrow in scope. It focuses on the core onboarding path:
 
 1. Sign in with Google.
 2. Create or restore the user's zkLogin wallet.
 3. Read the wallet address.
 4. Load balances from Sui testnet.
-5. Log out of the dApp session.
+5. Upload a binary file to Walrus testnet.
+6. List the Walrus files owned by the connected wallet address.
+7. Log out of the dApp session.
 
 ## What this project is trying to teach
 
@@ -19,6 +21,8 @@ This repository is useful if you want to understand these pieces together:
 - how Google OAuth is connected to wallet creation
 - how a React app can integrate the login flow
 - how to read balances from Sui once the account is connected
+- how Walrus stores binary blobs offchain while keeping ownership on Sui
+- how to list Walrus Blob objects owned by a Sui address
 
 ## Core technologies
 
@@ -31,6 +35,33 @@ The app uses a Sui client to:
 - resolve the connected account
 - request balances owned by that account
 - fetch coin metadata for better balance display
+- list Walrus Blob objects owned by that account
+
+### Walrus
+
+Walrus is the decentralized blob storage layer used by this app for file uploads.
+
+In this project, Walrus is used in two ways:
+
+- the public Walrus testnet publisher stores uploaded files as blobs
+- the connected Sui address becomes the owner of the resulting Walrus `Blob` object
+
+That split is important:
+
+- the file bytes live in Walrus
+- ownership, storage duration, and lifecycle controls live on Sui as objects
+
+This makes Walrus a better fit than storing raw file bytes directly onchain.
+
+### Public Walrus testnet publisher
+
+This app uses the public Walrus testnet publisher HTTP API for uploads.
+
+That means the current implementation does **not** require the user to hold test WAL just to upload through this UI. The publisher handles the storage write on testnet and sends the resulting blob object to the connected address.
+
+The app then lists the files by querying Sui for Walrus `Blob` objects owned by that address.
+
+This is different from a direct Walrus SDK write flow where the user's wallet signs the registration and certification transactions itself.
 
 ### zkLogin
 
@@ -81,21 +112,31 @@ This package provides wallet integration primitives for Sui apps. In this projec
 
 React Query is used for loading balances from Sui and managing loading / error state around those requests.
 
+### `@mysten/walrus`
+
+The Walrus SDK is used here for Walrus-specific client helpers, especially:
+
+- resolving the Walrus `Blob` Move type for object listing
+- reading parsed Walrus blob objects from Sui by object ID
+- reading Walrus blob attributes when present
+
 ## How the implementation works
 
 ### High-level architecture
 
-The app has three main runtime responsibilities:
+The app has four main runtime responsibilities:
 
 1. Configure the Sui testnet client and dApp Kit.
 2. Register a Google-based Enoki wallet provider.
-3. Render UI that connects the wallet and reads balances.
+3. Upload files to Walrus testnet through the public publisher.
+4. Render UI that connects the wallet, reads balances, and lists owned Walrus files.
 
 The relevant files are:
 
 - `src/dapp-kit.ts`
 - `src/RegisterEnokiWallets.tsx`
 - `src/App.tsx`
+- `src/walrus.ts`
 
 ### 1. Sui client and dApp Kit setup
 
@@ -122,7 +163,17 @@ That component does four important things:
 
 This is the bridge between the wallet framework and Enoki.
 
-### 3. Wallet UI and balance loading
+### 3. Walrus upload and owned-file listing
+
+In `src/App.tsx`, the app also adds a Walrus workflow:
+
+1. The user selects a file, number of epochs, and whether the blob should be deletable.
+2. The app uploads the file with an HTTP `PUT` request to the public Walrus testnet publisher.
+3. The request includes `send_object_to=<current wallet address>` so the new Walrus `Blob` object is owned by the connected user.
+4. The app queries Sui for Walrus `Blob` objects owned by that address.
+5. For each object, the app loads Walrus blob metadata and renders a file list with blob ID, object ID, size, storage expiry, and download link.
+
+### 4. Wallet UI and balance loading
 
 In `src/App.tsx`, the app:
 
@@ -130,6 +181,8 @@ In `src/App.tsx`, the app:
 - triggers wallet connection when the user clicks the button
 - reads the connected account from dApp Kit
 - loads balances for the connected Sui address
+- uploads files to Walrus
+- loads Walrus Blob objects for the connected address
 - formats and displays coin balances
 - disconnects the wallet on logout
 
@@ -139,6 +192,14 @@ The balance loading path looks like this:
 2. Call `client.listBalances({ owner: account.address })`.
 3. For each coin type, call `client.getCoinMetadata()`.
 4. Display symbol, name, and formatted amount.
+
+The Walrus file listing path looks like this:
+
+1. Resolve the Walrus `Blob` type through the Walrus SDK.
+2. Call `client.listOwnedObjects({ owner, type })` for the connected address.
+3. Load each Walrus blob object by its Sui object ID.
+4. Read Walrus blob attributes when available.
+5. Render a download URL through the Walrus aggregator.
 
 ## End-to-end login flow
 
@@ -152,7 +213,7 @@ This is the actual user flow in this project:
 6. Google authenticates the user and returns control to the redirect URL.
 7. Enoki uses the login result to resolve the user's zkLogin wallet.
 8. dApp Kit exposes the connected Sui account to the React app.
-9. The app loads token balances for that address.
+9. The app loads token balances and Walrus Blob objects for that address.
 
 ## What logout means in this app
 
@@ -228,9 +289,13 @@ Then set:
 ```dotenv
 VITE_ENOKI_API_KEY=your_enoki_public_api_key
 VITE_GOOGLE_CLIENT_ID=your_google_oauth_web_client_id
+VITE_WALRUS_PUBLISHER_URL=https://publisher.walrus-testnet.walrus.space
+VITE_WALRUS_AGGREGATOR_URL=https://aggregator.walrus-testnet.walrus.space
 ```
 
 Do not put a Google client secret into the frontend `.env`. Vite exposes `VITE_*` variables to the browser.
+
+The Walrus URLs are optional. If omitted, the app uses the testnet defaults shown above.
 
 ## 5. Install and run
 
@@ -290,6 +355,16 @@ Contains the app's main business logic:
 - account display
 - error display for auth failures
 - balance fetching and formatting
+- Walrus file upload form
+- Walrus owned-file listing
+
+### `src/walrus.ts`
+
+Contains Walrus-specific helpers:
+
+- default publisher and aggregator URLs
+- local metadata storage for recent uploads in the current browser
+- Walrus blob formatting helpers
 
 ### `src/index.css` and `src/App.css`
 
@@ -307,12 +382,13 @@ This app is intentionally limited.
 
 It currently does not include:
 
-- transaction signing UI
 - token transfers
 - sponsored transactions
 - mainnet support
 - multi-provider login
 - profile storage or app-specific backend logic
+
+The Walrus file listing is based on owned Walrus `Blob` objects on Sui. If a blob was uploaded elsewhere without transferring the blob object to this address, it will not appear in the list.
 
 ## Common issues
 
@@ -348,6 +424,58 @@ To test balances:
 1. Copy the address shown in the app.
 2. Send testnet assets to that address.
 3. Click `Refresh balances`.
+
+## How Walrus testnet works in this app
+
+This repository uses the **public Walrus testnet publisher**.
+
+That means:
+
+- uploads go to a public publisher endpoint over HTTP
+- the publisher stores the blob on Walrus testnet
+- the request tells the publisher to send the resulting Walrus `Blob` object to your connected Sui address
+- the app lists your files by reading the Walrus `Blob` objects your address owns on Sui testnet
+
+### Do you need test WAL for this app?
+
+For the current implementation in this repository: **no, not for the upload button in the UI**.
+
+Because the app uses the public Walrus testnet publisher, the browser upload flow does not directly spend your wallet's WAL balance.
+
+You may still want testnet SUI in the wallet for other dApp testing and for any future extension that writes Walrus metadata or signs Walrus transactions directly.
+
+### When do you need test WAL?
+
+You need test WAL if you switch to a direct Walrus client flow where **your own wallet** signs and pays for storage operations, for example:
+
+- using the Walrus CLI directly
+- using the Walrus TypeScript SDK to register and certify blobs with your wallet
+- running your own publisher or other custom Walrus write infrastructure
+
+In that model, you generally need:
+
+- testnet SUI for gas
+- testnet WAL for Walrus storage fees
+
+### How do you get test WAL?
+
+For a direct Walrus wallet flow on testnet:
+
+1. Fund your Sui address with testnet SUI from the Sui faucet.
+2. Install the Walrus CLI.
+3. Exchange some testnet SUI for testnet WAL with:
+
+```bash
+walrus get-wal --context testnet
+```
+
+The Walrus docs describe the standard setup flow as:
+
+1. Configure the Sui client for testnet.
+2. Fund the address with testnet SUI.
+3. Run `walrus get-wal --context testnet`.
+
+If you only use this repository exactly as implemented today, that extra step is not required.
 
 ## Scripts
 
