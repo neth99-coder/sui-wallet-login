@@ -44,12 +44,12 @@ Walrus is the decentralized blob storage layer used by this app for file uploads
 In this project, Walrus is used in two ways:
 
 - the public Walrus testnet publisher stores uploaded files as blobs
-- the connected Sui address becomes the owner of the resulting Walrus `Blob` object
+- the connected Sui address becomes the owner of the resulting Walrus `Blob` object and stores blob attributes on Sui when possible
 
 That split is important:
 
 - the file bytes live in Walrus
-- ownership, storage duration, and lifecycle controls live on Sui as objects
+- ownership, storage duration, and blob metadata live on Sui as objects / attributes
 
 This makes Walrus a better fit than storing raw file bytes directly onchain.
 
@@ -170,8 +170,10 @@ In `src/App.tsx`, the app also adds a Walrus workflow:
 1. The user selects a file, number of epochs, and whether the blob should be deletable.
 2. The app uploads the file with an HTTP `PUT` request to the public Walrus testnet publisher.
 3. The request includes `send_object_to=<current wallet address>` so the new Walrus `Blob` object is owned by the connected user.
-4. The app queries Sui for Walrus `Blob` objects owned by that address.
-5. For each object, the app loads Walrus blob metadata and renders a file list with blob ID, object ID, size, storage expiry, and download link.
+4. After the publisher returns the new blob object ID, the app attempts to write blob attributes on Sui using `writeBlobAttributesTransaction()`.
+5. The app polls and refetches the owned Walrus objects until the new object is visible in the wallet's file list.
+6. The app queries Sui for Walrus `Blob` objects owned by that address.
+7. For each object, the app loads Walrus blob metadata and renders a file list with object ID, blob ID, size, storage expiry, and download link.
 
 ### 4. Wallet UI and balance loading
 
@@ -200,6 +202,78 @@ The Walrus file listing path looks like this:
 3. Load each Walrus blob object by its Sui object ID.
 4. Read Walrus blob attributes when available.
 5. Render a download URL through the Walrus aggregator.
+
+## Walrus logic in this app
+
+This repository has three separate Walrus flows that are worth understanding: upload, retrieval, and download.
+
+### Upload flow
+
+When a user uploads a file, the app performs these steps:
+
+1. Read the selected browser `File` object.
+2. Validate the upload size against the public publisher limit.
+3. Build Walrus publisher query params:
+   `epochs`, `send_object_to=<connected Sui address>`, and either `deletable=true` or `permanent=true`.
+4. Send the file bytes to the public Walrus publisher with an HTTP `PUT`.
+5. Read the publisher response and extract:
+   the Walrus blob ID, the Sui blob object ID, and the storage end epoch.
+6. Attempt to write blob attributes on Sui for that blob object.
+7. Poll the owned-object query until the object appears in the list.
+
+The upload code lives primarily in `handleWalrusUpload()` in `src/App.tsx`.
+
+### What metadata is stored on Sui
+
+After upload, the app tries to write blob attributes on Sui with `writeBlobAttributesTransaction()`.
+
+The metadata payload is created in `src/walrus.ts` and currently includes:
+
+- `fileName`
+- `contentType`
+- `originalSize`
+- `uploadedAt`
+
+This metadata is not stored in browser local storage. It is intended to be stored as Walrus blob attributes on Sui.
+
+Important caveat: the metadata write is currently best-effort. If that transaction fails, the blob upload still succeeds, but the file may later fall back to a generated label instead of the original file name.
+
+### Retrieval / file listing flow
+
+The Files panel does not come from local app state. It is rebuilt from on-chain ownership each time the query runs.
+
+The logic is:
+
+1. Ask the Walrus SDK for the Move type of a Walrus `Blob` object.
+2. Query Sui for all owned objects of that type for the connected address.
+3. For each owned object ID:
+   try `walrusClient.walrus.getBlobObject(objectId)` first. If that fails, fall back to reading raw Sui object JSON and extracting the blob fields manually.
+4. Try to read blob attributes with `readBlobAttributes()`.
+5. Normalize the blob ID if it is stored in raw decimal form on the Sui object.
+6. Build the UI model for each file row.
+
+If metadata is present, the UI uses:
+
+- `fileName` from blob attributes
+- `contentType` from blob attributes
+
+If metadata is missing, the UI falls back to a generated file label based on the blob ID.
+
+### Download flow
+
+Downloads are served through the Walrus aggregator, not directly from Sui.
+
+The logic is:
+
+1. Convert the blob ID to the correct normalized base64url form when necessary.
+2. Build the aggregator URL: `/v1/blobs/<normalized blob id>`.
+3. Fetch the blob bytes from the aggregator.
+4. Determine the best MIME type:
+   use stored metadata if available, otherwise use the response content type, and if that is still generic, sniff the file header bytes.
+5. Create a browser `Blob` and trigger a file download.
+6. Add a file extension when the original name is missing one.
+
+This is why the app can still download files correctly even when metadata is incomplete.
 
 ## End-to-end login flow
 
@@ -356,14 +430,18 @@ Contains the app's main business logic:
 - error display for auth failures
 - balance fetching and formatting
 - Walrus file upload form
+- Walrus metadata write after upload
 - Walrus owned-file listing
+- Walrus download logic with MIME sniffing and extension recovery
 
 ### `src/walrus.ts`
 
 Contains Walrus-specific helpers:
 
 - default publisher and aggregator URLs
-- local metadata storage for recent uploads in the current browser
+- blob ID normalization from raw decimal u256 to base64url
+- blob attribute helpers for file name and content type
+- raw Sui object parsing fallback for Walrus blob objects
 - Walrus blob formatting helpers
 
 ### `src/index.css` and `src/App.css`

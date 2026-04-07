@@ -63,6 +63,41 @@
   color: #777;
 }
 
+.copy-inline-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.copy-inline-group-wide {
+  flex: 1;
+  min-width: 0;
+}
+
+.copy-value-btn {
+  border: 1px solid #e5e7eb;
+  background: #fff;
+  color: #6b7280;
+  border-radius: 999px;
+  padding: 4px 9px;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.copy-value-btn:hover {
+  background: #f9fafb;
+  border-color: #d1d5db;
+  color: #111827;
+}
+
 /* ─── Buttons ────────────────────────────────────────────── */
 .btn {
   display: inline-flex;
@@ -581,83 +616,144 @@
 
 .file-list {
   display: grid;
-  gap: 2px;
+  gap: 10px;
 }
 
 .file-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
-  padding: 11px 10px;
-  border-radius: 10px;
-  transition: background 100ms;
+  gap: 14px;
+  padding: 16px 14px;
+  border-radius: 14px;
+  border: 1px solid #ededed;
+  background: #fcfcfc;
+  transition:
+    background 100ms,
+    border-color 100ms,
+    box-shadow 100ms;
 }
 
 .file-row:hover {
-  background: #fafafa;
+  background: #ffffff;
+  border-color: #e3e3e3;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
 }
 
 .file-row-info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 5px;
   min-width: 0;
 }
 
 .file-name {
-  font-size: 0.88rem;
-  font-weight: 600;
+  font-size: 0.94rem;
+  font-weight: 700;
   color: #111;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.file-blob-id {
-  font-size: 0.7rem;
-  color: #ccc;
+.file-id-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+
+.file-id {
+  font-size: 0.74rem;
+  color: #94a3b8;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.copy-id-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+.copy-id-btn:hover {
+  color: #64748b;
+}
+
+.copy-status {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #c0c8d2;
+}
+
+.copy-id-btn:hover .copy-status,
+.copy-id-btn:focus-visible .copy-status {
+  color: #94a3b8;
+}
+
+.copy-id-btn:focus-visible,
+.copy-value-btn:focus-visible {
+  outline: 2px solid #cbd5e1;
+  outline-offset: 2px;
 }
 
 .file-row-meta {
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-  flex-wrap: nowrap;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+  margin-top: 2px;
 }
 
 .badge-type {
-  display: inline-block;
-  padding: 2px 7px;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 9px;
   border-radius: 999px;
   font-size: 0.67rem;
-  font-weight: 600;
-  background: #f0f0f0;
-  color: #555;
+  font-weight: 700;
+  background: #dbeafe;
+  color: #1d4ed8;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   white-space: nowrap;
-  max-width: 120px;
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.file-size,
-.file-epoch {
-  font-size: 0.78rem;
-  color: #888;
-  white-space: nowrap;
+.meta-chip,
+.badge-mode {
   display: inline-flex;
   align-items: center;
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.file-size,
+.file-epoch {
+  color: #4b5563;
+  background: #f3f4f6;
   gap: 3px;
+  border: 1px solid #eceff3;
 }
 
 .file-epoch-expired {
-  color: #f87171;
+  color: #b91c1c;
+  background: #fee2e2;
+  border-color: #fecaca;
 }
 
 /* ─── Info tooltip (ⓘ) ──────────────────────────────────── */
@@ -699,6 +795,7 @@
 /* ─── Expired file rows ──────────────────────────────────── */
 .file-row-expired {
   opacity: 0.55;
+  background: #fffafa;
 }
 
 .badge-expired {
@@ -728,23 +825,49 @@
 }
 
 .badge-mode {
-  display: inline-block;
-  padding: 2px 7px;
-  border-radius: 999px;
-  font-size: 0.67rem;
-  font-weight: 600;
-  white-space: nowrap;
   letter-spacing: 0.02em;
 }
 
 .badge-del {
-  background: #fef9c3;
+  background: #fef3c7;
   color: #854d0e;
 }
 
 .badge-perm {
   background: #dcfce7;
   color: #166534;
+}
+
+.file-row > .btn {
+  align-self: center;
+  justify-self: end;
+  min-width: 42px;
+  min-height: 38px;
+}
+
+@media (max-width: 860px) {
+  .file-list {
+    gap: 8px;
+  }
+
+  .file-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .file-row > .btn {
+    justify-self: start;
+  }
+}
+
+@media (max-width: 860px) {
+  .file-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .file-row > .btn {
+    justify-self: start;
+  }
 }
 
 /* ─── State text ─────────────────────────────────────────── */
@@ -791,6 +914,10 @@
     font-size: 0.8rem;
   }
 
+  .copy-inline-group-wide {
+    width: 100%;
+  }
+
   .address-bar-stats {
     align-self: flex-end;
   }
@@ -807,6 +934,10 @@
   }
 
   .topnav-address {
+    display: none;
+  }
+
+  .topnav-right > .copy-inline-group .copy-value-btn {
     display: none;
   }
 

@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Transaction } from "@mysten/sui/transactions";
 import {
   useCurrentAccount,
   useCurrentClient,
@@ -93,6 +94,8 @@ function App() {
   const [uploadFeedback, setUploadFeedback] = useState<UploadFeedback | null>(
     null,
   );
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const copyResetTimeoutRef = useRef<number | null>(null);
 
   const walrusClient = useMemo(() => getWalrusClient(client), [client]);
 
@@ -348,11 +351,17 @@ function App() {
       objectId,
     );
     try {
-      const transaction =
-        await walrusClient.walrus.writeBlobAttributesTransaction({
-          attributes: createWalrusBlobAttributes(file),
-          blobObjectId: objectId,
-        });
+      const transaction = new Transaction();
+
+      // Avoid the SDK's internal readBlobAttributes(blobObjectId) pre-read here.
+      // For a fresh upload we want to write against the just-created blob object
+      // reference directly, otherwise a stale metadata dynamic-field lookup can
+      // fail the transaction build before signing.
+      await walrusClient.walrus.writeBlobAttributesTransaction({
+        transaction,
+        blobObject: transaction.object(objectId),
+        attributes: createWalrusBlobAttributes(file),
+      });
 
       const txResult = await dAppKit.signAndExecuteTransaction({ transaction });
       console.log(
@@ -554,6 +563,40 @@ function App() {
   const totalFiles = allFiles.length;
   const totalAssets = balancesQuery.data?.length ?? 0;
 
+  async function copyTextToClipboard(text: string) {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "true");
+    textarea.style.position = "absolute";
+    textarea.style.left = "-9999px";
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    document.body.removeChild(textarea);
+  }
+
+  async function handleCopy(copyKey: string, text: string) {
+    try {
+      await copyTextToClipboard(text);
+      setCopiedKey(copyKey);
+
+      if (copyResetTimeoutRef.current !== null) {
+        window.clearTimeout(copyResetTimeoutRef.current);
+      }
+
+      copyResetTimeoutRef.current = window.setTimeout(() => {
+        setCopiedKey(null);
+      }, 1200);
+    } catch (error) {
+      console.warn("[copy] failed to copy text", error);
+    }
+  }
+
   return (
     <div className="app-root">
       {/* Top navigation */}
@@ -568,9 +611,21 @@ function App() {
           <span className="badge-network">{currentNetwork}</span>
           {account ? (
             <>
-              <span className="topnav-address mono">
-                {shortenAddress(account.address)}
-              </span>
+              <div className="copy-inline-group">
+                <span className="topnav-address mono">
+                  {shortenAddress(account.address)}
+                </span>
+                <button
+                  className="copy-value-btn"
+                  onClick={() =>
+                    void handleCopy("wallet-topnav", account.address)
+                  }
+                  title="Copy wallet address"
+                  type="button"
+                >
+                  {copiedKey === "wallet-topnav" ? "Copied" : "Copy"}
+                </button>
+              </div>
               <button
                 className="btn btn-outline btn-sm"
                 onClick={() => void handleLogout()}
@@ -631,9 +686,19 @@ function App() {
           <div className="address-bar">
             <div className="address-bar-left">
               <span className="address-bar-label">Wallet</span>
-              <span className="address-bar-value mono break">
-                {account.address}
-              </span>
+              <div className="copy-inline-group copy-inline-group-wide">
+                <span className="address-bar-value mono break">
+                  {account.address}
+                </span>
+                <button
+                  className="copy-value-btn"
+                  onClick={() => void handleCopy("wallet-bar", account.address)}
+                  title="Copy wallet address"
+                  type="button"
+                >
+                  {copiedKey === "wallet-bar" ? "Copied" : "Copy"}
+                </button>
+              </div>
             </div>
             <div className="address-bar-stats">
               <div className="stat-item">
@@ -867,37 +932,72 @@ function App() {
                       <article className="file-row" key={file.objectId}>
                         <div className="file-row-info">
                           <span className="file-name">
-                            Object {shortenObjectId(file.objectId)}
+                            {getDisplayFileName(file)}
                           </span>
-                          <span className="file-blob-id mono">
-                            Blob {shortenBlobId(file.blobId)}
-                          </span>
-                        </div>
-                        <div className="file-row-meta">
-                          {file.contentType ? (
-                            <span className="badge-type">
-                              {file.contentType}
-                            </span>
-                          ) : null}
-                          <span className="file-size">
-                            {formatBytes(file.size)}
-                          </span>
-                          <span className="file-epoch">
-                            ep.{file.storedUntilEpoch}
-                            {currentEpoch !== null ? (
-                              <span
-                                className="info-tip"
-                                aria-label={`Expires at Walrus epoch ${file.storedUntilEpoch}. Current epoch: ${currentEpoch}. ${file.storedUntilEpoch - currentEpoch} epoch(s) (~${file.storedUntilEpoch - currentEpoch} day(s)) remaining.`}
-                              >
-                                ⓘ
+                          <div className="file-id-row mono">
+                            <button
+                              className="file-id copy-id-btn"
+                              onClick={() =>
+                                void handleCopy(
+                                  `object-${file.objectId}`,
+                                  file.objectId,
+                                )
+                              }
+                              title="Copy object ID"
+                              type="button"
+                            >
+                              Object {shortenObjectId(file.objectId)}
+                              <span className="copy-status">
+                                {copiedKey === `object-${file.objectId}`
+                                  ? "Copied"
+                                  : "Copy"}
+                              </span>
+                            </button>
+                            <button
+                              className="file-id copy-id-btn"
+                              onClick={() =>
+                                void handleCopy(
+                                  `blob-${file.objectId}`,
+                                  file.blobId,
+                                )
+                              }
+                              title="Copy blob ID"
+                              type="button"
+                            >
+                              Blob {shortenBlobId(file.blobId)}
+                              <span className="copy-status">
+                                {copiedKey === `blob-${file.objectId}`
+                                  ? "Copied"
+                                  : "Copy"}
+                              </span>
+                            </button>
+                          </div>
+                          <div className="file-row-meta">
+                            {file.contentType ? (
+                              <span className="badge-type">
+                                {file.contentType}
                               </span>
                             ) : null}
-                          </span>
-                          <span
-                            className={`badge-mode ${file.deletable ? "badge-del" : "badge-perm"}`}
-                          >
-                            {file.deletable ? "deletable" : "permanent"}
-                          </span>
+                            <span className="file-size meta-chip">
+                              {formatBytes(file.size)}
+                            </span>
+                            <span className="file-epoch meta-chip">
+                              ep.{file.storedUntilEpoch}
+                              {currentEpoch !== null ? (
+                                <span
+                                  className="info-tip"
+                                  aria-label={`Expires at Walrus epoch ${file.storedUntilEpoch}. Current epoch: ${currentEpoch}. ${file.storedUntilEpoch - currentEpoch} epoch(s) (~${file.storedUntilEpoch - currentEpoch} day(s)) remaining.`}
+                                >
+                                  ⓘ
+                                </span>
+                              ) : null}
+                            </span>
+                            <span
+                              className={`badge-mode ${file.deletable ? "badge-del" : "badge-perm"}`}
+                            >
+                              {file.deletable ? "deletable" : "permanent"}
+                            </span>
+                          </div>
                         </div>
                         <button
                           className="btn btn-outline btn-sm"
@@ -928,33 +1028,68 @@ function App() {
                           >
                             <div className="file-row-info">
                               <span className="file-name">
-                                Object {shortenObjectId(file.objectId)}
+                                {getDisplayFileName(file)}
                               </span>
-                              <span className="file-blob-id mono">
-                                Blob {shortenBlobId(file.blobId)}
-                              </span>
-                            </div>
-                            <div className="file-row-meta">
-                              {file.contentType ? (
-                                <span className="badge-type">
-                                  {file.contentType}
-                                </span>
-                              ) : null}
-                              <span className="file-size">
-                                {formatBytes(file.size)}
-                              </span>
-                              <span className="file-epoch file-epoch-expired">
-                                ep.{file.storedUntilEpoch}
-                                <span
-                                  className="info-tip"
-                                  aria-label={`Storage ended at epoch ${file.storedUntilEpoch}. Current epoch: ${currentEpoch ?? "unknown"}. The blob object still exists on Sui but the data may no longer be retrievable.`}
+                              <div className="file-id-row mono">
+                                <button
+                                  className="file-id copy-id-btn"
+                                  onClick={() =>
+                                    void handleCopy(
+                                      `object-${file.objectId}`,
+                                      file.objectId,
+                                    )
+                                  }
+                                  title="Copy object ID"
+                                  type="button"
                                 >
-                                  ⓘ
+                                  Object {shortenObjectId(file.objectId)}
+                                  <span className="copy-status">
+                                    {copiedKey === `object-${file.objectId}`
+                                      ? "Copied"
+                                      : "Copy"}
+                                  </span>
+                                </button>
+                                <button
+                                  className="file-id copy-id-btn"
+                                  onClick={() =>
+                                    void handleCopy(
+                                      `blob-${file.objectId}`,
+                                      file.blobId,
+                                    )
+                                  }
+                                  title="Copy blob ID"
+                                  type="button"
+                                >
+                                  Blob {shortenBlobId(file.blobId)}
+                                  <span className="copy-status">
+                                    {copiedKey === `blob-${file.objectId}`
+                                      ? "Copied"
+                                      : "Copy"}
+                                  </span>
+                                </button>
+                              </div>
+                              <div className="file-row-meta">
+                                {file.contentType ? (
+                                  <span className="badge-type">
+                                    {file.contentType}
+                                  </span>
+                                ) : null}
+                                <span className="file-size meta-chip">
+                                  {formatBytes(file.size)}
                                 </span>
-                              </span>
-                              <span className="badge-mode badge-expired">
-                                expired
-                              </span>
+                                <span className="file-epoch file-epoch-expired meta-chip">
+                                  ep.{file.storedUntilEpoch}
+                                  <span
+                                    className="info-tip"
+                                    aria-label={`Storage ended at epoch ${file.storedUntilEpoch}. Current epoch: ${currentEpoch ?? "unknown"}. The blob object still exists on Sui but the data may no longer be retrievable.`}
+                                  >
+                                    ⓘ
+                                  </span>
+                                </span>
+                                <span className="badge-mode badge-expired">
+                                  expired
+                                </span>
+                              </div>
                             </div>
                             <button
                               className="btn btn-outline btn-sm"
@@ -1016,6 +1151,16 @@ function shortenBlobId(blobId: string): string {
   }
 
   return `${blobId.slice(0, 12)}\u2026${blobId.slice(-6)}`;
+}
+
+function isGeneratedFileName(fileName: string, blobId: string): boolean {
+  return fileName === `blob-${blobId.slice(0, 10)}`;
+}
+
+function getDisplayFileName(file: WalrusBlobRecord): string {
+  return isGeneratedFileName(file.fileName, file.blobId)
+    ? `File ${shortenObjectId(file.objectId)}`
+    : file.fileName;
 }
 
 const MIME_TO_EXT: Record<string, string> = {
