@@ -23,7 +23,7 @@ import {
   getWalrusDownloadUrl,
   getWalrusFileName,
   getWalrusPublisherUrl,
-  isObjectNotFoundError,
+  normalizeBlobId,
   type WalrusBlobRecord,
 } from "./walrus";
 
@@ -185,32 +185,48 @@ function App() {
 
             try {
               blobObject = await walrusClient.walrus.getBlobObject(objectId);
-            } catch (error) {
-              const { object } = await client.getObject({
+            } catch (getBlobError) {
+              console.warn(
+                "[walrus] getBlobObject failed for",
                 objectId,
-                include: { display: true, json: true },
-              });
-              const rawBlobObject = getRawWalrusBlobObject(object);
+                getBlobError,
+              );
+              try {
+                const { object } = await client.getObject({
+                  objectId,
+                  include: { display: true, json: true },
+                });
+                const rawBlobObject = getRawWalrusBlobObject(object);
 
-              if (!rawBlobObject) {
-                if (isObjectNotFoundError(error)) {
+                if (!rawBlobObject) {
+                  console.warn(
+                    "[walrus] getRawWalrusBlobObject returned null for",
+                    objectId,
+                    "— skipping",
+                  );
                   return null;
                 }
 
-                throw error;
+                blobObject = {
+                  blob_id: rawBlobObject.blobId,
+                  certified_epoch: rawBlobObject.certifiedEpoch,
+                  deletable: rawBlobObject.deletable,
+                  id: rawBlobObject.objectId,
+                  registered_epoch: rawBlobObject.registeredEpoch,
+                  size: rawBlobObject.size,
+                  storage: {
+                    end_epoch: rawBlobObject.storedUntilEpoch,
+                  },
+                };
+              } catch (getObjectError) {
+                console.warn(
+                  "[walrus] getObject fallback also failed for",
+                  objectId,
+                  getObjectError,
+                  "— skipping",
+                );
+                return null;
               }
-
-              blobObject = {
-                blob_id: rawBlobObject.blobId,
-                certified_epoch: rawBlobObject.certifiedEpoch,
-                deletable: rawBlobObject.deletable,
-                id: rawBlobObject.objectId,
-                registered_epoch: rawBlobObject.registeredEpoch,
-                size: rawBlobObject.size,
-                storage: {
-                  end_epoch: rawBlobObject.storedUntilEpoch,
-                },
-              };
             }
 
             let attributes: Record<string, string> | null = null;
@@ -223,17 +239,19 @@ function App() {
               attributes = null;
             }
 
+            const normalizedBlobId = normalizeBlobId(blobObject.blob_id);
+
             const fileName =
               getWalrusFileName(attributes) ??
-              formatBlobLabel(blobObject.blob_id);
+              formatBlobLabel(normalizedBlobId);
             const contentType = getWalrusContentType(attributes);
 
             return {
-              blobId: blobObject.blob_id,
+              blobId: normalizedBlobId,
               certifiedEpoch: blobObject.certified_epoch,
               contentType,
               deletable: blobObject.deletable,
-              downloadUrl: getWalrusDownloadUrl(blobObject.blob_id),
+              downloadUrl: getWalrusDownloadUrl(normalizedBlobId),
               fileName,
               objectId: blobObject.id,
               registeredEpoch: blobObject.registered_epoch,
@@ -241,11 +259,14 @@ function App() {
               storedUntilEpoch: blobObject.storage.end_epoch,
             } satisfies WalrusBlobRecord;
           } catch (error) {
-            if (isObjectNotFoundError(error)) {
-              return null;
-            }
-
-            throw error;
+            // Any unexpected error for a single object should not kill the whole list
+            console.warn(
+              "[walrus] unexpected error loading object",
+              objectId,
+              error,
+              "— skipping",
+            );
+            return null;
           }
         }),
       );
@@ -290,27 +311,63 @@ function App() {
   }
 
   async function refreshWalrusFilesUntilVisible(objectId: string) {
+    console.log(
+      "[walrus] refreshWalrusFilesUntilVisible: waiting for objectId",
+      objectId,
+    );
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const result = await walrusFilesQuery.refetch();
+      const foundIds = result.data?.map((f) => f.objectId) ?? [];
+      console.log(
+        `[walrus] attempt ${attempt + 1}: owned blob objectIds =`,
+        foundIds,
+      );
 
       if (result.data?.some((file) => file.objectId === objectId)) {
+        console.log("[walrus] objectId found in list, done.");
         return;
       }
 
       if (attempt < 3) {
+        console.log(`[walrus] objectId not found yet, retrying in 1200ms...`);
         await delay(1200);
       }
     }
+    console.warn(
+      "[walrus] objectId never appeared after 4 attempts:",
+      objectId,
+    );
   }
 
-  async function persistWalrusMetadataOnSui(objectId: string, file: File) {
-    const transaction =
-      await walrusClient.walrus.writeBlobAttributesTransaction({
-        attributes: createWalrusBlobAttributes(file),
-        blobObjectId: objectId,
-      });
+  async function persistWalrusMetadataOnSui(
+    objectId: string,
+    file: File,
+  ): Promise<void> {
+    console.log(
+      "[walrus] persistWalrusMetadataOnSui: writing attributes for objectId",
+      objectId,
+    );
+    try {
+      const transaction =
+        await walrusClient.walrus.writeBlobAttributesTransaction({
+          attributes: createWalrusBlobAttributes(file),
+          blobObjectId: objectId,
+        });
 
-    await dAppKit.signAndExecuteTransaction({ transaction });
+      const txResult = await dAppKit.signAndExecuteTransaction({ transaction });
+      console.log(
+        "[walrus] signAndExecuteTransaction result:",
+        JSON.stringify(txResult, null, 2),
+      );
+    } catch (error) {
+      // Attribute writing is best-effort. If it fails (e.g. a stale attributes
+      // object from a previous attempt references a consumed object), log and
+      // continue — the blob is already stored on Walrus.
+      console.warn(
+        "[walrus] writeBlobAttributesTransaction failed (non-fatal):",
+        error,
+      );
+    }
   }
 
   async function handleWalrusUpload() {
@@ -358,6 +415,8 @@ function App() {
         },
       );
 
+      console.log("[walrus] upload response:", response);
+
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(
@@ -366,12 +425,20 @@ function App() {
       }
 
       const payload = (await response.json()) as UploadResponse;
+      console.log("[walrus] upload payload:", payload);
 
       const newlyCreatedBlob = payload.newlyCreated?.blobObject;
       const alreadyCertifiedBlob = payload.alreadyCertified;
       const newObjectId = newlyCreatedBlob?.id;
 
       if (newlyCreatedBlob && newObjectId) {
+        console.log(
+          "[walrus] publisher returned newlyCreated objectId:",
+          newObjectId,
+          "blobId:",
+          newlyCreatedBlob.blobId,
+        );
+
         await persistWalrusMetadataOnSui(newObjectId, uploadFile);
 
         setUploadFeedback({
@@ -398,6 +465,7 @@ function App() {
       setUploadFile(null);
       setUploadEpochs("1");
     } catch (error) {
+      console.error("Upload error:", error);
       setUploadError(error instanceof Error ? error.message : "Upload failed");
     } finally {
       setIsUploading(false);
@@ -673,9 +741,9 @@ function App() {
 
                   {uploadFeedback?.kind === "newly-created" ? (
                     <p className="feedback-success">
-                      Uploaded. Blob{" "}
+                      Uploaded. Object{" "}
                       <span className="mono">
-                        {uploadFeedback.blobId.slice(0, 20)}\u2026
+                        {shortenObjectId(uploadFeedback.objectId)}
                       </span>{" "}
                       stored until epoch {uploadFeedback.storedUntilEpoch}.
                     </p>
@@ -685,7 +753,7 @@ function App() {
                     <p className="feedback-info">
                       Already stored. Blob{" "}
                       <span className="mono">
-                        {uploadFeedback.blobId.slice(0, 20)}\u2026
+                        {shortenBlobId(uploadFeedback.blobId)}
                       </span>{" "}
                       until epoch {uploadFeedback.storedUntilEpoch}.
                     </p>
@@ -799,12 +867,10 @@ function App() {
                       <article className="file-row" key={file.objectId}>
                         <div className="file-row-info">
                           <span className="file-name">
-                            {file.objectId.slice(0, 4) +
-                              " ... " +
-                              file.objectId.slice(-4)}
+                            Object {shortenObjectId(file.objectId)}
                           </span>
                           <span className="file-blob-id mono">
-                            {file.blobId.slice(0, 28)}\u2026
+                            Blob {shortenBlobId(file.blobId)}
                           </span>
                         </div>
                         <div className="file-row-meta">
@@ -862,12 +928,10 @@ function App() {
                           >
                             <div className="file-row-info">
                               <span className="file-name">
-                                {file.objectId.slice(0, 4) +
-                                  " ... " +
-                                  file.objectId.slice(-4)}
+                                Object {shortenObjectId(file.objectId)}
                               </span>
                               <span className="file-blob-id mono">
-                                {file.blobId.slice(0, 28)}\u2026
+                                Blob {shortenBlobId(file.blobId)}
                               </span>
                             </div>
                             <div className="file-row-meta">
@@ -940,6 +1004,18 @@ function formatBalance(balance: string, decimals: number) {
 function shortenAddress(address: string): string {
   if (address.length <= 12) return address;
   return `${address.slice(0, 6)}\u2026${address.slice(-4)}`;
+}
+
+function shortenObjectId(objectId: string): string {
+  return shortenAddress(objectId);
+}
+
+function shortenBlobId(blobId: string): string {
+  if (blobId.length <= 20) {
+    return blobId;
+  }
+
+  return `${blobId.slice(0, 12)}\u2026${blobId.slice(-6)}`;
 }
 
 const MIME_TO_EXT: Record<string, string> = {
