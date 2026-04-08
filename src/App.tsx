@@ -2,7 +2,6 @@ import { useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
-import { Transaction } from "@mysten/sui/transactions";
 import {
   useCurrentAccount,
   useCurrentClient,
@@ -14,21 +13,25 @@ import { isEnokiWallet, isGoogleWallet } from "@mysten/enoki";
 
 import "./App.css";
 import {
-  createWalrusBlobAttributes,
   formatBlobLabel,
   formatBytes,
   getMaxPublicUploadBytes,
   getRawWalrusBlobObject,
   getWalrusAggregatorUrl,
   getWalrusClient,
-  getWalrusContentType,
   getWalrusDownloadUrl,
-  getWalrusFileName,
   getWalrusPublisherUrl,
-  getWalrusUploadedAt,
   normalizeBlobId,
   type WalrusBlobRecord,
 } from "./walrus";
+import {
+  listLocalDeletedWalrusFiles,
+  listLocalWalrusFileMetadata,
+  markLocalWalrusFileDeleted,
+  saveLocalWalrusFile,
+  type DeletedBlobRecord,
+  type LocalWalrusFileMetadata,
+} from "./localWalrusMetadata";
 
 type BalanceRow = {
   balance: string;
@@ -70,19 +73,6 @@ type UploadResponse = {
       };
     };
   };
-};
-
-type DeletedBlobRecord = {
-  blobId: string | null;
-  contentType: string | null;
-  deletable: boolean | null;
-  digest: string | null;
-  fileName: string | null;
-  objectId: string;
-  size: string | null;
-  storedUntilEpoch: number | null;
-  timestampMs: string | null;
-  uploadedAt: string | null;
 };
 
 type DeletedHistoryArgument =
@@ -146,9 +136,6 @@ function App() {
   const [hiddenDeletedObjectIds, setHiddenDeletedObjectIds] = useState<
     string[]
   >([]);
-  const [deletedSnapshots, setDeletedSnapshots] = useState<
-    Record<string, DeletedBlobRecord>
-  >({});
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const copyResetTimeoutRef = useRef<number | null>(null);
 
@@ -213,6 +200,12 @@ function App() {
       if (!account) {
         return [];
       }
+
+      const localMetadataByObjectId = new Map<string, LocalWalrusFileMetadata>(
+        listLocalWalrusFileMetadata(currentNetwork, account.address).map(
+          (metadata) => [metadata.objectId, metadata],
+        ),
+      );
 
       const blobType = await walrusClient.walrus.getBlobType();
       const ownedObjectIds: string[] = [];
@@ -297,23 +290,12 @@ function App() {
               }
             }
 
-            let attributes: Record<string, string> | null = null;
-
-            try {
-              attributes = await walrusClient.walrus.readBlobAttributes({
-                blobObjectId: objectId,
-              });
-            } catch {
-              attributes = null;
-            }
-
             const normalizedBlobId = normalizeBlobId(blobObject.blob_id);
-
+            const localMetadata = localMetadataByObjectId.get(objectId) ?? null;
             const fileName =
-              getWalrusFileName(attributes) ??
-              formatBlobLabel(normalizedBlobId);
-            const contentType = getWalrusContentType(attributes);
-            const uploadedAt = getWalrusUploadedAt(attributes);
+              localMetadata?.fileName ?? formatBlobLabel(normalizedBlobId);
+            const contentType = localMetadata?.contentType ?? null;
+            const uploadedAt = localMetadata?.uploadedAt ?? null;
 
             return {
               blobId: normalizedBlobId,
@@ -329,7 +311,6 @@ function App() {
               uploadedAt,
             } satisfies WalrusBlobRecord;
           } catch (error) {
-            // Any unexpected error for a single object should not kill the whole list
             console.warn(
               "[walrus] unexpected error loading object",
               objectId,
@@ -392,7 +373,7 @@ function App() {
     );
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const result = await walrusFilesQuery.refetch();
-      const foundIds = result.data?.map((f) => f.objectId) ?? [];
+      const foundIds = result.data?.map((file) => file.objectId) ?? [];
       console.log(
         `[walrus] attempt ${attempt + 1}: owned blob objectIds =`,
         foundIds,
@@ -404,10 +385,11 @@ function App() {
       }
 
       if (attempt < 3) {
-        console.log(`[walrus] objectId not found yet, retrying in 1200ms...`);
+        console.log("[walrus] objectId not found yet, retrying in 1200ms...");
         await delay(1200);
       }
     }
+
     console.warn(
       "[walrus] objectId never appeared after 4 attempts:",
       objectId,
@@ -440,43 +422,6 @@ function App() {
       if (attempt < 3) {
         await delay(1200);
       }
-    }
-  }
-
-  async function persistWalrusMetadataOnSui(
-    objectId: string,
-    file: File,
-  ): Promise<void> {
-    console.log(
-      "[walrus] persistWalrusMetadataOnSui: writing attributes for objectId",
-      objectId,
-    );
-    try {
-      const transaction = new Transaction();
-
-      // Avoid the SDK's internal readBlobAttributes(blobObjectId) pre-read here.
-      // For a fresh upload we want to write against the just-created blob object
-      // reference directly, otherwise a stale metadata dynamic-field lookup can
-      // fail the transaction build before signing.
-      await walrusClient.walrus.writeBlobAttributesTransaction({
-        transaction,
-        blobObject: transaction.object(objectId),
-        attributes: createWalrusBlobAttributes(file),
-      });
-
-      const txResult = await dAppKit.signAndExecuteTransaction({ transaction });
-      console.log(
-        "[walrus] signAndExecuteTransaction result:",
-        JSON.stringify(txResult, null, 2),
-      );
-    } catch (error) {
-      // Attribute writing is best-effort. If it fails (e.g. a stale attributes
-      // object from a previous attempt references a consumed object), log and
-      // continue — the blob is already stored on Walrus.
-      console.warn(
-        "[walrus] writeBlobAttributesTransaction failed (non-fatal):",
-        error,
-      );
     }
   }
 
@@ -549,7 +494,16 @@ function App() {
           newlyCreatedBlob.blobId,
         );
 
-        await persistWalrusMetadataOnSui(newObjectId, uploadFile);
+        const normalizedBlobId = normalizeBlobId(newlyCreatedBlob.blobId);
+        const uploadedAt = new Date().toISOString();
+
+        saveLocalWalrusFile(currentNetwork, account.address, {
+          blobId: normalizedBlobId,
+          contentType: uploadFile.type || "application/octet-stream",
+          fileName: uploadFile.name || formatBlobLabel(normalizedBlobId),
+          objectId: newObjectId,
+          uploadedAt,
+        });
 
         setUploadFeedback({
           blobId: newlyCreatedBlob.blobId,
@@ -667,22 +621,7 @@ function App() {
 
       await dAppKit.signAndExecuteTransaction({ transaction });
 
-      setDeletedSnapshots((current) => ({
-        ...current,
-        [file.objectId]: {
-          blobId: file.blobId,
-          contentType: file.contentType,
-          deletable: file.deletable,
-          digest: null,
-          fileName: file.fileName,
-          objectId: file.objectId,
-          size: file.size,
-          storedUntilEpoch: file.storedUntilEpoch,
-          timestampMs: String(Date.now()),
-          uploadedAt: file.uploadedAt,
-        },
-      }));
-
+      markLocalWalrusFileDeleted(currentNetwork, account.address, file);
       setHiddenDeletedObjectIds((current) =>
         current.includes(file.objectId) ? current : [...current, file.objectId],
       );
@@ -733,28 +672,30 @@ function App() {
         order: "descending",
       });
 
-      const records = new Map<string, DeletedBlobRecord>();
-
-      for (const tx of response.data as DeletedHistoryTransaction[]) {
-        for (const objectId of extractDeletedBlobObjectIds(tx)) {
-          if (!records.has(objectId)) {
-            records.set(objectId, {
-              blobId: null,
-              contentType: null,
-              deletable: true,
-              digest: tx.digest,
-              fileName: null,
-              objectId,
-              size: null,
-              storedUntilEpoch: null,
-              timestampMs: tx.timestampMs ?? null,
-              uploadedAt: null,
-            });
-          }
-        }
-      }
-
-      return Array.from(records.values());
+      return mergeDeletedBlobRecords(
+        Array.from(
+          new Map(
+            (response.data as DeletedHistoryTransaction[]).flatMap((tx) =>
+              extractDeletedBlobObjectIds(tx).map((objectId) => [
+                objectId,
+                {
+                  blobId: null,
+                  contentType: null,
+                  deletable: true,
+                  digest: tx.digest,
+                  fileName: null,
+                  objectId,
+                  size: null,
+                  storedUntilEpoch: null,
+                  timestampMs: tx.timestampMs ?? null,
+                  uploadedAt: null,
+                } satisfies DeletedBlobRecord,
+              ]),
+            ),
+          ).values(),
+        ),
+        listLocalDeletedWalrusFiles(currentNetwork, account.address),
+      );
     },
   });
 
@@ -762,10 +703,7 @@ function App() {
   const allFiles = (walrusFilesQuery.data ?? []).filter(
     (file) => !hiddenDeletedObjectIds.includes(file.objectId),
   );
-  const deletedFiles = mergeDeletedBlobRecords(
-    deletedFilesQuery.data ?? [],
-    Object.values(deletedSnapshots),
-  );
+  const deletedFiles = deletedFilesQuery.data ?? [];
   const activeFiles =
     currentEpoch !== null
       ? allFiles.filter((f) => f.storedUntilEpoch >= currentEpoch)
@@ -1578,6 +1516,18 @@ function getDisplayFileName(file: WalrusBlobRecord): string {
     : file.fileName;
 }
 
+function getDeletedDisplayName(file: DeletedBlobRecord): string {
+  if (
+    file.fileName &&
+    file.blobId &&
+    !isGeneratedFileName(file.fileName, file.blobId)
+  ) {
+    return file.fileName;
+  }
+
+  return `Deleted ${shortenObjectId(file.objectId)}`;
+}
+
 function extractDeletedBlobObjectIds(
   transaction: DeletedHistoryTransaction,
 ): string[] {
@@ -1649,18 +1599,6 @@ function mergeDeletedBlobRecords(
     (left, right) =>
       Number(right.timestampMs ?? 0) - Number(left.timestampMs ?? 0),
   );
-}
-
-function getDeletedDisplayName(file: DeletedBlobRecord): string {
-  if (
-    file.fileName &&
-    file.blobId &&
-    !isGeneratedFileName(file.fileName, file.blobId)
-  ) {
-    return file.fileName;
-  }
-
-  return `Deleted ${shortenObjectId(file.objectId)}`;
 }
 
 function formatDeletedTimestamp(timestampMs: string): string {
