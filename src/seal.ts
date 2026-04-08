@@ -152,7 +152,36 @@ export async function createWalletBackedSessionKey({
     ttlMin,
   });
 
+  const personalMessage = sessionKey.getPersonalMessage();
+
+  console.log("[seal] session:create:state", {
+    address: sessionKey.getAddress(),
+    isExpired: sessionKey.isExpired(),
+    packageId: sessionKey.getPackageId(),
+    packageName: sessionKey.getPackageName(),
+    personalMessageBytes: personalMessage.byteLength,
+    personalMessageText: decodeUtf8(personalMessage),
+  });
+
+  console.log(
+    "[seal] session:create:export",
+    summarizeExportedSessionKey(sessionKey.export()),
+  );
+
   const certificate = await sessionKey.getCertificate();
+  const exportedWithSignature = sessionKey.export();
+
+  console.log(
+    "[seal] session:create:export-with-signature",
+    summarizeExportedSessionKey(exportedWithSignature),
+  );
+
+  await logLocalSignatureValidation({
+    certificateSignature: certificate.signature,
+    exportedSessionKey: exportedWithSignature,
+    label: "[seal] session:create:local-signature-validation",
+    suiClient,
+  });
 
   console.log("[seal] session:create:certificate-ready", {
     address,
@@ -233,7 +262,36 @@ export async function decryptWithSeal({
       ttlMin,
     }));
 
+  const sessionState = summarizeSessionKey(resolvedSessionKey);
+
+  console.log("[seal] decrypt:session-state", sessionState);
+
+  const requestParams = await resolvedSessionKey.createRequestParams(txBytes);
+
+  console.log("[seal] decrypt:request-params", {
+    encKeyBytes: requestParams.encKey.byteLength,
+    encKeyPkBytes: requestParams.encKeyPk.byteLength,
+    encKeyPkPreview: toHexPreview(requestParams.encKeyPk),
+    encVerificationKeyBytes: requestParams.encVerificationKey.byteLength,
+    encVerificationKeyPreview: toHexPreview(requestParams.encVerificationKey),
+    requestSignatureLength: requestParams.requestSignature.length,
+    requestSignaturePrefix: requestParams.requestSignature.slice(0, 24),
+  });
+
   const certificate = await resolvedSessionKey.getCertificate();
+  const exportedWithSignature = resolvedSessionKey.export();
+
+  console.log(
+    "[seal] decrypt:export-with-signature",
+    summarizeExportedSessionKey(exportedWithSignature),
+  );
+
+  await logLocalSignatureValidation({
+    certificateSignature: certificate.signature,
+    exportedSessionKey: exportedWithSignature,
+    label: "[seal] decrypt:local-signature-validation",
+    suiClient,
+  });
 
   console.log("[seal] decrypt:certificate", {
     address: certificate.user,
@@ -264,6 +322,7 @@ export async function decryptWithSeal({
     console.error("[seal] decrypt:error", {
       address: address ?? null,
       encryptedBytes: encryptedBytes.byteLength,
+      sessionState,
       packageId: packageId ?? null,
       txBytes: txBytes.byteLength,
       error,
@@ -298,4 +357,90 @@ function requiredValue<T>(value: T | undefined, name: string): T {
   }
 
   return value;
+}
+
+function summarizeSessionKey(sessionKey: SessionKey) {
+  const exported = sessionKey.export();
+  const personalMessage = sessionKey.getPersonalMessage();
+
+  return {
+    address: sessionKey.getAddress(),
+    isExpired: sessionKey.isExpired(),
+    packageId: sessionKey.getPackageId(),
+    packageName: sessionKey.getPackageName(),
+    personalMessageBytes: personalMessage.byteLength,
+    personalMessageText: decodeUtf8(personalMessage),
+    exported: summarizeExportedSessionKey(exported),
+  };
+}
+
+function summarizeExportedSessionKey(
+  exported: ReturnType<SessionKey["export"]>,
+) {
+  return {
+    address: exported.address,
+    creationTimeMs: exported.creationTimeMs,
+    hasPersonalMessageSignature: Boolean(exported.personalMessageSignature),
+    mvrName: exported.mvrName ?? null,
+    packageId: exported.packageId,
+    sessionKeyLength: exported.sessionKey.length,
+    ttlMin: exported.ttlMin,
+  };
+}
+
+function decodeUtf8(value: Uint8Array) {
+  try {
+    return new TextDecoder().decode(value);
+  } catch {
+    return null;
+  }
+}
+
+function toHexPreview(value: Uint8Array, bytes = 8) {
+  return Array.from(value.slice(0, bytes))
+    .map((item) => item.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function logLocalSignatureValidation({
+  certificateSignature,
+  exportedSessionKey,
+  label,
+  suiClient,
+}: {
+  certificateSignature: string;
+  exportedSessionKey: ReturnType<SessionKey["export"]>;
+  label: string;
+  suiClient: SealCompatibleClient;
+}) {
+  try {
+    const sessionKeyForValidation = SessionKey.import(
+      {
+        ...exportedSessionKey,
+        personalMessageSignature: undefined,
+      },
+      suiClient,
+    );
+
+    await sessionKeyForValidation.setPersonalMessageSignature(
+      certificateSignature,
+    );
+
+    console.log(label, {
+      ok: true,
+      packageId: sessionKeyForValidation.getPackageId(),
+      sessionAddress: sessionKeyForValidation.getAddress(),
+      signatureLength: certificateSignature.length,
+      signaturePrefix: certificateSignature.slice(0, 24),
+    });
+  } catch (error) {
+    console.error(label, {
+      ok: false,
+      packageId: exportedSessionKey.packageId,
+      sessionAddress: exportedSessionKey.address,
+      signatureLength: certificateSignature.length,
+      signaturePrefix: certificateSignature.slice(0, 24),
+      error,
+    });
+  }
 }

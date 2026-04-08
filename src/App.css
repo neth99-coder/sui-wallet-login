@@ -280,6 +280,11 @@
   line-height: 1.5;
 }
 
+.login-actions {
+  display: grid;
+  gap: 12px;
+}
+
 /* ─── Address bar ────────────────────────────────────────── */
 .address-bar {
   display: flex;

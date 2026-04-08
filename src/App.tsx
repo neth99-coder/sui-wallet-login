@@ -202,6 +202,22 @@ function App() {
     () => wallets.filter(isEnokiWallet).find(isGoogleWallet) ?? null,
     [wallets],
   );
+  const browserWallet = useMemo(() => {
+    const nonEnokiWallets = wallets.filter(
+      (wallet) =>
+        !isEnokiWallet(
+          wallet as unknown as Parameters<typeof isEnokiWallet>[0],
+        ),
+    );
+
+    return (
+      nonEnokiWallets.find((wallet) =>
+        wallet.name.toLowerCase().includes("slush"),
+      ) ??
+      nonEnokiWallets[0] ??
+      null
+    );
+  }, [wallets]);
 
   const balancesQuery = useQuery({
     queryKey: ["balances", currentNetwork, account?.address],
@@ -427,6 +443,48 @@ function App() {
     } finally {
       console.log("[auth] google-login:done", {
         currentNetwork,
+      });
+      setIsSigningIn(false);
+    }
+  }
+
+  async function handleBrowserWalletLogin() {
+    if (!browserWallet) {
+      return;
+    }
+
+    console.log("[auth] browser-wallet-login:start", {
+      currentNetwork,
+      walletAccounts: browserWallet.accounts.map(
+        (walletAccount) => walletAccount.address,
+      ),
+      walletName: browserWallet.name,
+    });
+
+    setLoginError(null);
+    setIsSigningIn(true);
+
+    try {
+      const result = await dAppKit.connectWallet({ wallet: browserWallet });
+
+      console.log("[auth] browser-wallet-login:connected", {
+        accounts: result.accounts.map((walletAccount) => walletAccount.address),
+        currentNetwork,
+        walletName: browserWallet.name,
+      });
+
+      if (!result.accounts.length) {
+        setLoginError(
+          `${browserWallet.name} connected, but no wallet account was returned.`,
+        );
+      }
+    } catch (error) {
+      console.error("[auth] browser-wallet-login:error", error);
+      setLoginError(formatLoginError(error));
+    } finally {
+      console.log("[auth] browser-wallet-login:done", {
+        currentNetwork,
+        walletName: browserWallet.name,
       });
       setIsSigningIn(false);
     }
@@ -1439,18 +1497,30 @@ function App() {
             <p className="login-sub">
               Decentralized file storage on Sui&rsquo;s Walrus protocol
             </p>
-            <button
-              className="btn btn-black btn-large btn-google"
-              disabled={!googleWallet || !isConfigured || isSigningIn}
-              onClick={() => void handleGoogleLogin()}
-            >
-              <span className="google-mark" aria-hidden="true">
-                G
-              </span>
-              {isSigningIn ? "Signing in\u2026" : "Continue with Google"}
-            </button>
-            {!googleWallet && isConfigured ? (
-              <p className="hint-text">Registering wallet provider\u2026</p>
+            <div className="login-actions">
+              <button
+                className="btn btn-black btn-large btn-google"
+                disabled={!googleWallet || !isConfigured || isSigningIn}
+                onClick={() => void handleGoogleLogin()}
+              >
+                <span className="google-mark" aria-hidden="true">
+                  G
+                </span>
+                {isSigningIn ? "Signing in\u2026" : "Continue with Google"}
+              </button>
+              <button
+                className="btn btn-outline btn-large"
+                disabled={!browserWallet || isSigningIn}
+                onClick={() => void handleBrowserWalletLogin()}
+                type="button"
+              >
+                {isSigningIn
+                  ? "Connecting\u2026"
+                  : `Continue with ${browserWallet?.name ?? "browser wallet"}`}
+              </button>
+            </div>
+            {!googleWallet && !browserWallet && isConfigured ? (
+              <p className="hint-text">Registering wallet providers\u2026</p>
             ) : null}
             {loginError ? <p className="feedback-error">{loginError}</p> : null}
           </div>
