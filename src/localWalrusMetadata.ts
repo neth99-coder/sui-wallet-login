@@ -18,6 +18,7 @@ export type LocalWalrusWhitelist = {
   capId: string;
   createdAt: string;
   id: string;
+  isMyselfGroup: boolean;
   members: string[];
   name: string;
   ownerAddress: string;
@@ -132,6 +133,7 @@ function normalizeLocalWalrusWhitelist(
         ? whitelist.createdAt
         : new Date().toISOString(),
     id: typeof whitelist.id === "string" ? whitelist.id : "",
+    isMyselfGroup: whitelist.isMyselfGroup === true,
     members: Array.isArray(whitelist.members)
       ? whitelist.members.filter(
           (value): value is string => typeof value === "string",

@@ -141,6 +141,7 @@ const sealPolicyPackageId = import.meta.env.VITE_SEAL_POLICY_PACKAGE_ID as
   | undefined;
 const isSealConfigured = Boolean(sealPolicyPackageId);
 const SEAL_POLICY_MODULE_NAME = "whitelist";
+const MYSELF_GROUP_NAME = "Myself";
 const JSON_RPC_URLS = {
   testnet: "https://fullnode.testnet.sui.io:443",
 } as const;
@@ -645,6 +646,7 @@ function App() {
       capId: created.capId,
       createdAt: new Date().toISOString(),
       id: created.whitelistId,
+      isMyselfGroup: false,
       members: [normalizeSuiAddress(account.address)],
       name,
       ownerAddress: normalizeSuiAddress(account.address),
@@ -721,6 +723,41 @@ function App() {
     }
   }
 
+  async function getOrCreateMyselfWhitelist(): Promise<LocalWalrusWhitelist> {
+    if (!account) {
+      throw new Error("No connected account.");
+    }
+
+    const existing = (whitelistsQuery.data ?? []).find((w) => w.isMyselfGroup);
+    if (existing) {
+      return existing;
+    }
+
+    const created = await createWhitelist(MYSELF_GROUP_NAME);
+    patchLocalWalrusWhitelist(
+      currentNetwork,
+      account.address,
+      created.whitelistId,
+      { isMyselfGroup: true },
+    );
+
+    // Read directly from localStorage — whitelistsQuery.data is a stale
+    // closure and won't reflect the refetch result until the next render.
+    const updated = listLocalWalrusWhitelists(
+      currentNetwork,
+      account.address,
+    ).find((w) => w.id === created.whitelistId);
+
+    // Fire in the background so the Lists panel refreshes in the UI.
+    void whitelistsQuery.refetch();
+
+    if (!updated) {
+      throw new Error("Failed to retrieve the Myself group after creation.");
+    }
+
+    return updated;
+  }
+
   async function handleWalrusUpload() {
     if (!account || !uploadFile) {
       return;
@@ -774,9 +811,7 @@ function App() {
           ) ?? null;
 
         if (!selectedWhitelist) {
-          throw new Error(
-            "Choose a whitelist before uploading an encrypted file.",
-          );
+          selectedWhitelist = await getOrCreateMyselfWhitelist();
         }
 
         keyId = createKeyIdForWhitelist(selectedWhitelist.id);
@@ -1908,10 +1943,26 @@ function App() {
                                     </span>
                                   </button>
                                 </div>
-                                <span className="meta-chip meta-chip-uploaded">
-                                  {whitelist.members.length} member
-                                  {whitelist.members.length === 1 ? "" : "s"}
-                                </span>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    gap: "0.4rem",
+                                    alignItems: "center",
+                                  }}
+                                >
+                                  {whitelist.isMyselfGroup ? (
+                                    <span
+                                      className="meta-chip"
+                                      title="This group is managed automatically and cannot be modified."
+                                    >
+                                      protected
+                                    </span>
+                                  ) : null}
+                                  <span className="meta-chip meta-chip-uploaded">
+                                    {whitelist.members.length} member
+                                    {whitelist.members.length === 1 ? "" : "s"}
+                                  </span>
+                                </div>
                               </div>
 
                               <div className="whitelist-card-section">
@@ -1932,6 +1983,7 @@ function App() {
                                         className="share-member-chip"
                                         disabled={
                                           isOwner ||
+                                          whitelist.isMyselfGroup ||
                                           updatingWhitelistId === whitelist.id
                                         }
                                         onClick={() =>
@@ -1942,15 +1994,19 @@ function App() {
                                           )
                                         }
                                         title={
-                                          isOwner
-                                            ? "Creator keeps access by default"
-                                            : "Remove member"
+                                          whitelist.isMyselfGroup
+                                            ? "This group is managed automatically"
+                                            : isOwner
+                                              ? "Creator keeps access by default"
+                                              : "Remove member"
                                         }
                                         type="button"
                                       >
                                         {shortenAddress(member)}
                                         <span className="share-member-remove">
-                                          {isOwner ? "owner" : "×"}
+                                          {isOwner || whitelist.isMyselfGroup
+                                            ? "owner"
+                                            : "×"}
                                         </span>
                                       </button>
                                     );
@@ -1959,65 +2015,84 @@ function App() {
                               </div>
 
                               <div className="whitelist-card-section whitelist-card-section-accent">
-                                <div className="whitelist-card-section-header">
-                                  <span className="share-label">
-                                    Add member
-                                  </span>
-                                </div>
-                                <div className="file-share-form whitelist-member-form">
-                                  <input
-                                    className="text-input mono"
-                                    placeholder="0x..."
-                                    value={
-                                      whitelistMemberInputs[whitelist.id] ?? ""
-                                    }
-                                    onChange={(event) =>
-                                      setWhitelistMemberInputs((current) => ({
-                                        ...current,
-                                        [whitelist.id]: event.target.value,
-                                      }))
-                                    }
-                                  />
-                                  <button
-                                    className="btn btn-outline btn-sm"
-                                    disabled={
-                                      updatingWhitelistId === whitelist.id ||
-                                      !canAddWhitelistMember(
-                                        whitelist,
-                                        whitelistMemberInputs[whitelist.id] ??
-                                          "",
-                                      )
-                                    }
-                                    onClick={() =>
-                                      void handleWhitelistMemberUpdate(
-                                        whitelist,
-                                        whitelistMemberInputs[whitelist.id] ??
-                                          "",
-                                        "add",
-                                      )
-                                    }
-                                    type="button"
-                                  >
-                                    {updatingWhitelistId === whitelist.id
-                                      ? "Saving\u2026"
-                                      : "Add member"}
-                                  </button>
-                                </div>
-                                {whitelistMemberFeedback[whitelist.id] ? (
+                                {whitelist.isMyselfGroup ? (
                                   <p
-                                    className={
-                                      whitelistMemberFeedback[whitelist.id]
-                                        ?.kind === "error"
-                                        ? "feedback-error"
-                                        : "feedback-success"
-                                    }
+                                    className="hint-text"
+                                    style={{ margin: 0 }}
                                   >
-                                    {
-                                      whitelistMemberFeedback[whitelist.id]
-                                        ?.message
-                                    }
+                                    This group is managed automatically. Only
+                                    you have access.
                                   </p>
-                                ) : null}
+                                ) : (
+                                  <>
+                                    <div className="whitelist-card-section-header">
+                                      <span className="share-label">
+                                        Add member
+                                      </span>
+                                    </div>
+                                    <div className="file-share-form whitelist-member-form">
+                                      <input
+                                        className="text-input mono"
+                                        placeholder="0x..."
+                                        value={
+                                          whitelistMemberInputs[whitelist.id] ??
+                                          ""
+                                        }
+                                        onChange={(event) =>
+                                          setWhitelistMemberInputs(
+                                            (current) => ({
+                                              ...current,
+                                              [whitelist.id]:
+                                                event.target.value,
+                                            }),
+                                          )
+                                        }
+                                      />
+                                      <button
+                                        className="btn btn-outline btn-sm"
+                                        disabled={
+                                          updatingWhitelistId ===
+                                            whitelist.id ||
+                                          !canAddWhitelistMember(
+                                            whitelist,
+                                            whitelistMemberInputs[
+                                              whitelist.id
+                                            ] ?? "",
+                                          )
+                                        }
+                                        onClick={() =>
+                                          void handleWhitelistMemberUpdate(
+                                            whitelist,
+                                            whitelistMemberInputs[
+                                              whitelist.id
+                                            ] ?? "",
+                                            "add",
+                                          )
+                                        }
+                                        type="button"
+                                      >
+                                        {updatingWhitelistId === whitelist.id
+                                          ? "Saving\u2026"
+                                          : "Add member"}
+                                      </button>
+                                    </div>
+                                    {whitelistMemberFeedback[whitelist.id] ? (
+                                      <p
+                                        className={
+                                          whitelistMemberFeedback[whitelist.id]
+                                            ?.kind === "error"
+                                            ? "feedback-error"
+                                            : "feedback-success"
+                                        }
+                                      >
+                                        {
+                                          whitelistMemberFeedback[whitelist.id]
+                                            ?.message
+                                        }
+                                      </p>
+                                    ) : null}
+                                  </>
+                                )}
                               </div>
                             </article>
                           ))}
@@ -2141,7 +2216,7 @@ function App() {
                           className="field-label"
                           htmlFor="walrus-whitelist-select"
                         >
-                          Whitelist
+                          Access Group
                         </label>
                         <select
                           id="walrus-whitelist-select"
@@ -2151,12 +2226,14 @@ function App() {
                             setUploadWhitelistId(event.target.value)
                           }
                         >
-                          <option value="">Select a whitelist</option>
-                          {whitelists.map((whitelist) => (
-                            <option key={whitelist.id} value={whitelist.id}>
-                              {whitelist.name}
-                            </option>
-                          ))}
+                          <option value="">Only me (default)</option>
+                          {whitelists
+                            .filter((whitelist) => !whitelist.isMyselfGroup)
+                            .map((whitelist) => (
+                              <option key={whitelist.id} value={whitelist.id}>
+                                {whitelist.name}
+                              </option>
+                            ))}
                         </select>
                       </div>
                     ) : null}
@@ -2166,8 +2243,7 @@ function App() {
                       disabled={
                         !uploadFile ||
                         isUploading ||
-                        (uploadEncrypt &&
-                          (!isSealConfigured || !uploadWhitelistId))
+                        (uploadEncrypt && !isSealConfigured)
                       }
                       onClick={() => void handleWalrusUpload()}
                     >
@@ -2183,12 +2259,6 @@ function App() {
                         Add <code>VITE_SEAL_POLICY_PACKAGE_ID</code> after
                         publishing the whitelist package to enable encrypted
                         uploads.
-                      </p>
-                    ) : null}
-
-                    {uploadEncrypt && !whitelists.length ? (
-                      <p className="feedback-error">
-                        Create a whitelist before uploading an encrypted file.
                       </p>
                     ) : null}
 
