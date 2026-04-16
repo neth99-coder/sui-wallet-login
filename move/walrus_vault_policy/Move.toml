@@ -6,4 +6,4 @@ edition = "2024.beta"
 Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
 
 [addresses]
-walrus_vault_policy = "0x0"
+walrus_vault_policy = "0xfe9d233c5988d3cfe9421c460c50206b67b6e92f2c0ec3e71f6930e9e7e1c088"

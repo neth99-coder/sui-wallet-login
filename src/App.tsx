@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
@@ -46,6 +46,12 @@ import {
   encryptWithSeal,
   hexStringToBytes,
 } from "./seal";
+import { sha256Hex } from "./fileHash";
+import {
+  buildRegisterHashTransaction,
+  queryAllBlobHashes,
+  type HashEntry,
+} from "./blobHashRegistry";
 import {
   clearEnokiIndexedDb,
   clearInvalidEnokiLoginState,
@@ -140,13 +146,24 @@ const sealPolicyPackageId = import.meta.env.VITE_SEAL_POLICY_PACKAGE_ID as
   | string
   | undefined;
 const isSealConfigured = Boolean(sealPolicyPackageId);
+// Hash registry lives in the upgraded package (VITE_HASH_REGISTRY_PACKAGE_ID).
+// Falls back to sealPolicyPackageId only when both modules are co-deployed.
+const hashRegistryPackageId = (import.meta.env.VITE_HASH_REGISTRY_PACKAGE_ID ??
+  sealPolicyPackageId) as string | undefined;
+const isHashRegistryConfigured = Boolean(hashRegistryPackageId);
 const SEAL_POLICY_MODULE_NAME = "whitelist";
 const MYSELF_GROUP_NAME = "Myself";
 const JSON_RPC_URLS = {
   testnet: "https://fullnode.testnet.sui.io:443",
 } as const;
 
-type WorkspaceSection = "files" | "lists" | "upload" | "shared" | "assets";
+type WorkspaceSection =
+  | "files"
+  | "lists"
+  | "upload"
+  | "shared"
+  | "assets"
+  | "verify";
 
 function App() {
   const account = useCurrentAccount();
@@ -203,6 +220,33 @@ function App() {
   >([]);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const copyResetTimeoutRef = useRef<number | null>(null);
+  const [verifyFile, setVerifyFile] = useState<File | null>(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<"match" | "no-match" | null>(
+    null,
+  );
+  const [verifyMatchEntry, setVerifyMatchEntry] = useState<HashEntry | null>(
+    null,
+  );
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  // Registry entries for the public landing page
+  const [registryEntries, setRegistryEntries] = useState<HashEntry[]>([]);
+  const [isLoadingRegistry, setIsLoadingRegistry] = useState(false);
+  const [registryError, setRegistryError] = useState<string | null>(null);
+  const [registrySearch, setRegistrySearch] = useState("");
+  // Per-file verify state (inline verify for a specific registry entry)
+  const [perFileVerifyTarget, setPerFileVerifyTarget] = useState<string | null>(
+    null,
+  );
+  const [perFileVerifyFile, setPerFileVerifyFile] = useState<File | null>(null);
+  const [perFileVerifyResult, setPerFileVerifyResult] = useState<
+    "match" | "no-match" | null
+  >(null);
+  const [perFileVerifyIsVerifying, setPerFileVerifyIsVerifying] =
+    useState(false);
+  const [perFileVerifyError, setPerFileVerifyError] = useState<string | null>(
+    null,
+  );
 
   const walrusClient = useMemo(() => getWalrusClient(client), [client]);
   const historyClient = useMemo(() => {
@@ -420,6 +464,51 @@ function App() {
         .sort((left, right) => Number(BigInt(right.size) - BigInt(left.size)));
     },
   });
+
+  // Load the on-chain hash registry when the public landing page is visible.
+  useEffect(() => {
+    if (account || !isHashRegistryConfigured || !hashRegistryPackageId) return;
+
+    const rpcUrl =
+      JSON_RPC_URLS[currentNetwork as keyof typeof JSON_RPC_URLS] ??
+      JSON_RPC_URLS.testnet;
+    setIsLoadingRegistry(true);
+    setRegistryError(null);
+    queryAllBlobHashes(hashRegistryPackageId, rpcUrl)
+      .then((entries) => {
+        setRegistryEntries([...entries].reverse());
+      })
+      .catch((err: unknown) => {
+        setRegistryError(
+          err instanceof Error ? err.message : "Failed to load registry",
+        );
+      })
+      .finally(() => {
+        setIsLoadingRegistry(false);
+      });
+  }, [account, currentNetwork, hashRegistryPackageId]);
+
+  async function handlePerFileVerify(targetEntry: HashEntry) {
+    if (!perFileVerifyFile) return;
+
+    setPerFileVerifyIsVerifying(true);
+    setPerFileVerifyResult(null);
+    setPerFileVerifyError(null);
+
+    try {
+      const bytes = new Uint8Array(await perFileVerifyFile.arrayBuffer());
+      const hash = await sha256Hex(bytes);
+      setPerFileVerifyResult(
+        hash === targetEntry.sha256Hex ? "match" : "no-match",
+      );
+    } catch (err: unknown) {
+      setPerFileVerifyError(
+        err instanceof Error ? err.message : "Verification failed",
+      );
+    } finally {
+      setPerFileVerifyIsVerifying(false);
+    }
+  }
 
   async function handleGoogleLogin() {
     if (!googleWallet) {
@@ -800,6 +889,15 @@ function App() {
     try {
       const sealClient = historyClient ?? client;
       const plainBytes = new Uint8Array(await uploadFile.arrayBuffer());
+
+      // Compute SHA-256 of the plaintext before encryption so external
+      // parties can verify document authenticity without needing access.
+      const plaintextSha256 = await sha256Hex(plainBytes);
+      console.log("[hash] computed sha256", {
+        fileName: uploadFile.name,
+        sha256: plaintextSha256,
+      });
+
       let uploadBytes: Uint8Array = plainBytes;
       let selectedWhitelist: LocalWalrusWhitelist | null = null;
       let keyId: string | null = null;
@@ -915,6 +1013,31 @@ function App() {
           storedUntilEpoch: newlyCreatedBlob.storage.endEpoch,
         });
 
+        // Register SHA-256 hash on-chain so anyone can verify later.
+        if (hashRegistryPackageId) {
+          try {
+            const hashTx = buildRegisterHashTransaction(
+              hashRegistryPackageId,
+              normalizedBlobId,
+              newObjectId,
+              plaintextSha256,
+              uploadFile.name,
+            );
+            await signAndExecuteTransaction(hashTx);
+            console.log("[hash-registry] hash registered on-chain", {
+              blobId: normalizedBlobId,
+              objectId: newObjectId,
+              sha256: plaintextSha256,
+            });
+          } catch (hashError) {
+            // Non-fatal: the Walrus upload already succeeded.
+            console.warn(
+              "[hash-registry] failed to register hash (non-fatal)",
+              hashError,
+            );
+          }
+        }
+
         await refreshWalrusFilesUntilVisible(newObjectId);
       } else {
         await walrusFilesQuery.refetch();
@@ -940,6 +1063,65 @@ function App() {
     } finally {
       setIsUploading(false);
     }
+  }
+
+  async function handleVerify() {
+    if (!verifyFile) {
+      return;
+    }
+
+    if (!hashRegistryPackageId) {
+      setVerifyError(
+        "Set VITE_HASH_REGISTRY_PACKAGE_ID (or VITE_SEAL_POLICY_PACKAGE_ID if co-deployed) so the verifier knows which on-chain registry to query.",
+      );
+      return;
+    }
+
+    const rpcUrl =
+      JSON_RPC_URLS[currentNetwork as keyof typeof JSON_RPC_URLS] ??
+      JSON_RPC_URLS.testnet;
+
+    setIsVerifying(true);
+    setVerifyResult(null);
+    setVerifyMatchEntry(null);
+    setVerifyError(null);
+
+    try {
+      const bytes = new Uint8Array(await verifyFile.arrayBuffer());
+      const hash = await sha256Hex(bytes);
+      console.log("[verify] computed sha256", {
+        fileName: verifyFile.name,
+        sha256: hash,
+      });
+
+      const entries = await queryAllBlobHashes(hashRegistryPackageId, rpcUrl);
+      console.log("[verify] fetched on-chain entries", {
+        count: entries.length,
+      });
+
+      const match = entries.find((entry) => entry.sha256Hex === hash) ?? null;
+
+      if (match) {
+        setVerifyResult("match");
+        setVerifyMatchEntry(match);
+      } else {
+        setVerifyResult("no-match");
+      }
+    } catch (error) {
+      console.error("[verify] error", error);
+      setVerifyError(
+        error instanceof Error ? error.message : "Verification failed",
+      );
+    } finally {
+      setIsVerifying(false);
+    }
+  }
+
+  function handleVerifyFileSelection(event: ChangeEvent<HTMLInputElement>) {
+    setVerifyResult(null);
+    setVerifyMatchEntry(null);
+    setVerifyError(null);
+    setVerifyFile(event.target.files?.[0] ?? null);
   }
 
   function formatLoginError(error: unknown) {
@@ -1645,10 +1827,120 @@ function App() {
     }
   }
 
+  function renderVerifyPanel() {
+    return (
+      <>
+        <div className="card-header">
+          <h2>Verify Document</h2>
+        </div>
+        <p className="hint-text" style={{ marginBottom: "1rem" }}>
+          Check whether a file you hold matches a document stored on Walrus.
+          Verification is computed entirely in your browser — no login, no gas,
+          no data is uploaded.
+        </p>
+
+        {!isHashRegistryConfigured ? (
+          <p className="feedback-error">
+            Set <code>VITE_HASH_REGISTRY_PACKAGE_ID</code> to enable on-chain
+            hash lookups.
+          </p>
+        ) : (
+          <div className="upload-form">
+            <div className="field-group">
+              <label className="field-label" htmlFor="verify-file-input">
+                Select file to verify
+              </label>
+              <input
+                accept="*/*"
+                id="verify-file-input"
+                onChange={handleVerifyFileSelection}
+                type="file"
+              />
+            </div>
+
+            {verifyFile ? (
+              <p className="hint-text">
+                Selected: <strong>{verifyFile.name}</strong> (
+                {formatBytes(String(verifyFile.size))})
+              </p>
+            ) : null}
+
+            <button
+              className="btn btn-primary"
+              disabled={!verifyFile || isVerifying}
+              onClick={() => void handleVerify()}
+              type="button"
+            >
+              {isVerifying ? "Verifying\u2026" : "Verify"}
+            </button>
+
+            {verifyError ? (
+              <p className="feedback-error">{verifyError}</p>
+            ) : null}
+
+            {verifyResult === "match" && verifyMatchEntry ? (
+              <div
+                className="alert alert-success"
+                style={{ marginTop: "1rem" }}
+              >
+                <strong>&#10003; Match found</strong>
+                <p>
+                  This file matches a document registered on-chain by{" "}
+                  <span className="mono break">
+                    {verifyMatchEntry.uploader}
+                  </span>
+                  .
+                </p>
+                <dl className="verify-match-details">
+                  <dt>File name</dt>
+                  <dd>{verifyMatchEntry.fileName || "—"}</dd>
+                  <dt>Blob ID</dt>
+                  <dd className="mono break">{verifyMatchEntry.blobId}</dd>
+                  <dt>Walrus object ID</dt>
+                  <dd className="mono break">
+                    {verifyMatchEntry.objectId || "—"}
+                  </dd>
+                  <dt>SHA-256</dt>
+                  <dd className="mono break">{verifyMatchEntry.sha256Hex}</dd>
+                  {verifyMatchEntry.timestampMs ? (
+                    <>
+                      <dt>Registered at</dt>
+                      <dd>
+                        {new Date(
+                          Number(verifyMatchEntry.timestampMs),
+                        ).toLocaleString()}
+                      </dd>
+                    </>
+                  ) : null}
+                </dl>
+              </div>
+            ) : null}
+
+            {verifyResult === "no-match" ? (
+              <div
+                className="alert alert-warning"
+                style={{ marginTop: "1rem" }}
+              >
+                <strong>&#10005; No match found</strong>
+                <p>
+                  No on-chain record exists for this file&rsquo;s SHA-256 hash.
+                  Either the document was never registered or the file has been
+                  modified.
+                </p>
+              </div>
+            ) : null}
+          </div>
+        )}
+      </>
+    );
+  }
+
   return (
     <div className="app-root">
       {/* Top navigation */}
-      <nav className="topnav">
+      <nav
+        className={`topnav${!account && isConfigured ? " topnav-landing" : ""}`}
+      >
         <div className="topnav-brand">
           <span className="brand-mark" aria-hidden="true">
             ◈
@@ -1699,44 +1991,400 @@ function App() {
         </div>
       ) : null}
 
-      {/* Login page */}
+      {/* Landing page */}
       {isConfigured && !account ? (
-        <div className="login-page">
-          <div className="login-card">
-            <div className="login-mark" aria-hidden="true">
-              ◈
+        <div className="landing">
+          {/* ── Hero ───────────────────────────────────── */}
+          <section className="lp-hero">
+            <div className="lp-hero-mesh" aria-hidden="true" />
+            <div className="lp-hero-grid" aria-hidden="true" />
+            <div className="lp-hero-content">
+              <div className="lp-hero-badge">
+                <span className="lp-hero-badge-dot" />
+                Built on Sui · Walrus Protocol
+              </div>
+              <h1 className="lp-hero-title">
+                Secure.&nbsp;Verifiable.
+                <br />
+                Decentralised.
+              </h1>
+              <p className="lp-hero-sub">
+                Store files on&nbsp;Walrus, encrypt with&nbsp;Seal, prove
+                authenticity on&#8209;chain — no custodian, no trust required.
+              </p>
+
+              {/* Login buttons */}
+              <div className="lp-login-actions">
+                <button
+                  className="lp-btn-primary"
+                  disabled={!googleWallet || !isConfigured || isSigningIn}
+                  onClick={() => void handleGoogleLogin()}
+                  type="button"
+                >
+                  <span className="lp-google-mark" aria-hidden="true">
+                    G
+                  </span>
+                  {isSigningIn ? "Signing in…" : "Continue with Google"}
+                </button>
+                <button
+                  className="lp-btn-secondary"
+                  disabled={!browserWallet || isSigningIn}
+                  onClick={() => void handleBrowserWalletLogin()}
+                  type="button"
+                >
+                  {isSigningIn
+                    ? "Connecting…"
+                    : `Continue with ${browserWallet?.name ?? "browser wallet"}`}
+                </button>
+              </div>
+              {!googleWallet && !browserWallet && isConfigured ? (
+                <p className="lp-hint">Registering wallet providers…</p>
+              ) : null}
+              {loginError ? <p className="lp-error">{loginError}</p> : null}
+
+              <a className="lp-scroll-cue" href="#lp-verify">
+                ↓ Verify a document — no sign-in required
+              </a>
             </div>
-            <h1 className="login-title">Walrus Vault</h1>
-            <p className="login-sub">
-              Decentralized file storage on Sui&rsquo;s Walrus protocol
-            </p>
-            <div className="login-actions">
-              <button
-                className="btn btn-black btn-large btn-google"
-                disabled={!googleWallet || !isConfigured || isSigningIn}
-                onClick={() => void handleGoogleLogin()}
-              >
-                <span className="google-mark" aria-hidden="true">
-                  G
+
+            {/* Animated vault visual */}
+            <div className="lp-hero-visual" aria-hidden="true">
+              <div className="lp-vault-ring lp-vault-ring-1" />
+              <div className="lp-vault-ring lp-vault-ring-2" />
+              <div className="lp-vault-ring lp-vault-ring-3" />
+              <div className="lp-vault-core">◈</div>
+            </div>
+          </section>
+
+          {/* ── Feature pills ──────────────────────────── */}
+          <section className="lp-features">
+            <div className="lp-feature-card">
+              <span className="lp-feature-icon">🔒</span>
+              <h3 className="lp-feature-title">Encrypted Storage</h3>
+              <p className="lp-feature-desc">
+                Files are encrypted with Mysten Labs&rsquo; Seal threshold
+                encryption before hitting Walrus — only allow-listed addresses
+                can decrypt.
+              </p>
+            </div>
+            <div className="lp-feature-card">
+              <span className="lp-feature-icon">⛓️</span>
+              <h3 className="lp-feature-title">On-chain Integrity</h3>
+              <p className="lp-feature-desc">
+                SHA-256 hashes are registered in a Move smart contract, creating
+                an immutable, public record anyone can audit.
+              </p>
+            </div>
+            <div className="lp-feature-card">
+              <span className="lp-feature-icon">🔍</span>
+              <h3 className="lp-feature-title">Zero-knowledge Verify</h3>
+              <p className="lp-feature-desc">
+                Verification runs entirely in your browser. No login, no gas, no
+                data leaves your device — just a hash comparison.
+              </p>
+            </div>
+          </section>
+
+          {/* ── Verify section ─────────────────────────── */}
+          {isHashRegistryConfigured ? (
+            <section className="lp-verify-section" id="lp-verify">
+              <div className="lp-section-label">Verify a document</div>
+              <h2 className="lp-section-title">Is your file authentic?</h2>
+              <p className="lp-section-sub">
+                Drop any file — we hash it locally and compare against the
+                on-chain registry. No data is uploaded.
+              </p>
+
+              <div className="lp-verify-card">
+                <div className="lp-verify-dropzone">
+                  <label
+                    className="lp-dropzone-label"
+                    htmlFor="lp-verify-input"
+                  >
+                    <span className="lp-dropzone-icon">📄</span>
+                    <span className="lp-dropzone-text">
+                      {verifyFile
+                        ? `${verifyFile.name} (${formatBytes(String(verifyFile.size))})`
+                        : "Click to select a file"}
+                    </span>
+                    <input
+                      accept="*/*"
+                      id="lp-verify-input"
+                      onChange={handleVerifyFileSelection}
+                      type="file"
+                      className="lp-file-input-hidden"
+                    />
+                  </label>
+                </div>
+
+                <button
+                  className="lp-btn-verify"
+                  disabled={!verifyFile || isVerifying}
+                  onClick={() => void handleVerify()}
+                  type="button"
+                >
+                  {isVerifying ? "Verifying…" : "Verify"}
+                </button>
+
+                {verifyError ? (
+                  <p className="lp-error" style={{ marginTop: "0.75rem" }}>
+                    {verifyError}
+                  </p>
+                ) : null}
+
+                {verifyResult === "match" && verifyMatchEntry ? (
+                  <div className="lp-result lp-result-match">
+                    <div className="lp-result-icon">✓</div>
+                    <div className="lp-result-body">
+                      <strong>Match found</strong>
+                      <p>
+                        Registered on-chain by{" "}
+                        <span className="lp-mono">
+                          {verifyMatchEntry.uploader}
+                        </span>
+                      </p>
+                      <dl className="lp-result-dl">
+                        <dt>File name</dt>
+                        <dd>{verifyMatchEntry.fileName || "—"}</dd>
+                        <dt>Blob ID</dt>
+                        <dd className="lp-mono lp-break">
+                          {verifyMatchEntry.blobId}
+                        </dd>
+                        <dt>SHA-256</dt>
+                        <dd className="lp-mono lp-break">
+                          {verifyMatchEntry.sha256Hex}
+                        </dd>
+                        {verifyMatchEntry.timestampMs ? (
+                          <>
+                            <dt>Registered</dt>
+                            <dd>
+                              {new Date(
+                                Number(verifyMatchEntry.timestampMs),
+                              ).toLocaleString()}
+                            </dd>
+                          </>
+                        ) : null}
+                      </dl>
+                    </div>
+                  </div>
+                ) : null}
+
+                {verifyResult === "no-match" ? (
+                  <div className="lp-result lp-result-nomatch">
+                    <div className="lp-result-icon">✗</div>
+                    <div className="lp-result-body">
+                      <strong>No match found</strong>
+                      <p>
+                        No on-chain record exists for this file&rsquo;s SHA-256
+                        hash. The document may not have been registered, or it
+                        has been modified.
+                      </p>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </section>
+          ) : null}
+
+          {/* ── Hash Registry ──────────────────────────── */}
+          {isHashRegistryConfigured ? (
+            <section className="lp-registry-section">
+              <div className="lp-section-label">On-chain registry</div>
+              <h2 className="lp-section-title" style={{ marginBottom: 0 }}>
+                Registered Files
+              </h2>
+              <p className="lp-section-sub">
+                Every file uploaded through Walrus Vault has its SHA-256 hash
+                stored immutably on Sui. Verify any entry directly.
+              </p>
+              <div className="lp-registry-search-wrap">
+                <span className="lp-search-icon" aria-hidden="true">
+                  🔍
                 </span>
-                {isSigningIn ? "Signing in\u2026" : "Continue with Google"}
-              </button>
-              <button
-                className="btn btn-outline btn-large"
-                disabled={!browserWallet || isSigningIn}
-                onClick={() => void handleBrowserWalletLogin()}
-                type="button"
-              >
-                {isSigningIn
-                  ? "Connecting\u2026"
-                  : `Continue with ${browserWallet?.name ?? "browser wallet"}`}
-              </button>
-            </div>
-            {!googleWallet && !browserWallet && isConfigured ? (
-              <p className="hint-text">Registering wallet providers\u2026</p>
-            ) : null}
-            {loginError ? <p className="feedback-error">{loginError}</p> : null}
-          </div>
+                <input
+                  className="lp-registry-search"
+                  type="search"
+                  placeholder="Search by name, hash or blob ID…"
+                  value={registrySearch}
+                  onChange={(e) => setRegistrySearch(e.target.value)}
+                  aria-label="Search registered files"
+                />
+                {registrySearch ? (
+                  <button
+                    className="lp-search-clear"
+                    type="button"
+                    aria-label="Clear search"
+                    onClick={() => setRegistrySearch("")}
+                  >
+                    ×
+                  </button>
+                ) : null}
+              </div>
+
+              {isLoadingRegistry ? (
+                <div className="lp-registry-loading">
+                  <span className="lp-spinner" />
+                  Loading on-chain records…
+                </div>
+              ) : registryError ? (
+                <p className="lp-error">{registryError}</p>
+              ) : registryEntries.length === 0 ? (
+                <div className="lp-registry-empty">
+                  No files registered yet. Upload a file to get started.
+                </div>
+              ) : (
+                (() => {
+                  const q = registrySearch.trim().toLowerCase();
+                  const filtered = q
+                    ? registryEntries.filter(
+                        (e) =>
+                          (e.fileName ?? "").toLowerCase().includes(q) ||
+                          e.sha256Hex.toLowerCase().includes(q) ||
+                          e.blobId.toLowerCase().includes(q),
+                      )
+                    : registryEntries;
+                  return filtered.length === 0 ? (
+                    <div className="lp-registry-empty">
+                      No results for &ldquo;{registrySearch}&rdquo;
+                    </div>
+                  ) : (
+                    <div className="lp-registry-list">
+                      {filtered.map((entry) => {
+                        const isOpen = perFileVerifyTarget === entry.blobId;
+                        return (
+                          <div key={entry.blobId} className="lp-registry-row">
+                            <div className="lp-registry-row-top">
+                              <div className="lp-registry-info">
+                                <span className="lp-registry-filename">
+                                  {entry.fileName || "Untitled"}
+                                </span>
+                                <span className="lp-registry-hash lp-mono">
+                                  {entry.sha256Hex.slice(0, 16)}…
+                                </span>
+                                {entry.timestampMs ? (
+                                  <span className="lp-registry-date">
+                                    {new Date(
+                                      Number(entry.timestampMs),
+                                    ).toLocaleDateString()}
+                                  </span>
+                                ) : null}
+                              </div>
+                              <button
+                                className={`lp-btn-verify-inline${isOpen ? " lp-btn-verify-inline-active" : ""}`}
+                                onClick={() => {
+                                  if (isOpen) {
+                                    setPerFileVerifyTarget(null);
+                                    setPerFileVerifyFile(null);
+                                    setPerFileVerifyResult(null);
+                                    setPerFileVerifyError(null);
+                                  } else {
+                                    setPerFileVerifyTarget(entry.blobId);
+                                    setPerFileVerifyFile(null);
+                                    setPerFileVerifyResult(null);
+                                    setPerFileVerifyError(null);
+                                  }
+                                }}
+                                type="button"
+                              >
+                                {isOpen ? "Close" : "Verify this file"}
+                              </button>
+                            </div>
+
+                            {isOpen ? (
+                              <div className="lp-per-file-verify">
+                                <span className="lp-pf-label">
+                                  Select a local copy of{" "}
+                                  <em>{entry.fileName || "this file"}</em> to
+                                  compare:
+                                </span>
+                                <div className="lp-pf-row">
+                                  <div className="lp-pf-picker-wrap">
+                                    <input
+                                      accept="*/*"
+                                      id={`pf-${entry.blobId}`}
+                                      type="file"
+                                      className="file-input-native"
+                                      onChange={(e) => {
+                                        setPerFileVerifyFile(
+                                          e.target.files?.[0] ?? null,
+                                        );
+                                        setPerFileVerifyResult(null);
+                                        setPerFileVerifyError(null);
+                                      }}
+                                    />
+                                    <label
+                                      className="file-picker-btn lp-pf-picker-btn"
+                                      htmlFor={`pf-${entry.blobId}`}
+                                    >
+                                      {perFileVerifyFile
+                                        ? perFileVerifyFile.name
+                                        : "Choose file"}
+                                    </label>
+                                  </div>
+                                  <button
+                                    className="lp-btn-verify"
+                                    disabled={
+                                      !perFileVerifyFile ||
+                                      perFileVerifyIsVerifying
+                                    }
+                                    onClick={() =>
+                                      void handlePerFileVerify(entry)
+                                    }
+                                    type="button"
+                                  >
+                                    {perFileVerifyIsVerifying
+                                      ? "Checking…"
+                                      : "Check"}
+                                  </button>
+                                </div>
+                                {perFileVerifyError ? (
+                                  <p className="lp-error">
+                                    {perFileVerifyError}
+                                  </p>
+                                ) : null}
+                                {perFileVerifyResult === "match" ? (
+                                  <div className="lp-result lp-result-match lp-result-sm">
+                                    <div className="lp-result-icon">✓</div>
+                                    <div className="lp-result-body">
+                                      <strong>Authentic</strong>
+                                      <p>
+                                        Your file matches the on-chain SHA-256
+                                        hash.
+                                      </p>
+                                    </div>
+                                  </div>
+                                ) : null}
+                                {perFileVerifyResult === "no-match" ? (
+                                  <div className="lp-result lp-result-nomatch lp-result-sm">
+                                    <div className="lp-result-icon">✗</div>
+                                    <div className="lp-result-body">
+                                      <strong>Hash mismatch</strong>
+                                      <p>
+                                        Your file does not match the registered
+                                        hash.
+                                      </p>
+                                    </div>
+                                  </div>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()
+              )}
+            </section>
+          ) : null}
+
+          {/* ── Footer ─────────────────────────────────── */}
+          <footer className="lp-footer">
+            <span className="lp-footer-brand">◈ Walrus Vault</span>
+            <span className="lp-footer-sub">
+              Powered by Sui · Walrus · Seal
+            </span>
+          </footer>
         </div>
       ) : null}
 
